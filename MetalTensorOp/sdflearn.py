@@ -71,15 +71,19 @@ class SineLayer(nn.Module):
     def forward(self, x): return torch.sin(self.ω0 * self.lin(x))
 
 class SIREN(nn.Module):
-    def __init__(self, ω0=10., hidden_dim=128):
+    def __init__(self, hidden_dim=128, num_layers=3):
         super().__init__()
-        self.net = nn.Sequential(
-            SineLayer(2, hidden_dim, True,  ω0),
-            SineLayer(hidden_dim, hidden_dim, False, ω0),
-            SineLayer(hidden_dim, hidden_dim, False, ω0),
-            nn.Linear(hidden_dim, 1)
-        )
-    def forward(self, x): return self.net(x)
+        layers = []
+        # First layer with ω0=30
+        layers.append(SineLayer(2, hidden_dim, first=True, ω0=30.))
+        # Hidden layers with ω0=1
+        for _ in range(num_layers - 1):
+            layers.append(SineLayer(hidden_dim, hidden_dim, first=False, ω0=1.))
+        # Final linear layer
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+    def forward(self, x):
+        return self.net(x)
 
 def export_weights(net, path):
     import json
@@ -105,21 +109,24 @@ def export_weights(net, path):
 # ---------------------------------------------------------------------------
 # 4)  Training loop + plotting
 # ---------------------------------------------------------------------------
-def train_and_show(coords, sdf, res, steps=2000, lr=1e-3, weights_path="weights.json", hidden_dim=128):
-    device = 'cpu'
+def train_and_show(coords, sdf, res, steps=2000, lr=1e-3, weights_path="weights.json", hidden_dim=128, num_layers=3):
+    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     X = torch.tensor(coords, dtype=torch.float32, device=device)
     Y = torch.tensor(sdf,    dtype=torch.float32, device=device).unsqueeze(1)
 
-    net = SIREN(hidden_dim=hidden_dim).to(device)
+    net = SIREN(hidden_dim=hidden_dim, num_layers=num_layers).to(device)
     optim = torch.optim.Adam(net.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=steps)
     mse   = nn.MSELoss()
 
     for it in range(1, steps+1):
-        idx  = torch.randint(0, X.size(0), (1024,))
-        loss = mse(net(X[idx]), Y[idx])
-        optim.zero_grad(); loss.backward(); optim.step()
-        if not it % 500:
-            print(f"step {it:4d}   batch MSE = {loss.item():.6f}")
+        loss = mse(net(X), Y)
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        scheduler.step()
+        if it % (steps // 10) == 0 or it == 1:
+            print(f"step {it:4d}   loss = {loss.item():.6f}")
 
     with torch.no_grad():
         pred = net(X).squeeze().cpu().numpy()
@@ -141,8 +148,20 @@ if __name__ == "__main__":
     ap.add_argument("--res", type=int, default=64, help="grid resolution (default 64)")
     ap.add_argument("--weights", default="weights.json",
                     help="where to write trained weights (default: weights.json)")
+    ap.add_argument("--steps", type=int, default=2000,
+                    help="number of training steps (default: 2000)")
+    ap.add_argument("--hidden_dim", type=int, default=128,
+                    help="width of hidden layers (default: 128)")
+    ap.add_argument("--num_layers", type=int, default=3,
+                    help="number of SIREN hidden layers (default: 3)")
+    ap.add_argument("--lr", type=float, default=1e-3,
+                    help="learning rate (default: 1e-3)")
     args = ap.parse_args()
 
     poly         = sample_svg(args.svg)
     coords, sdf  = sdf_from_poly(poly, res=args.res)
-    train_and_show(coords, sdf, res=args.res, weights_path=args.weights)
+    train_and_show(coords, sdf, res=args.res,
+                   steps=args.steps, lr=args.lr,
+                   weights_path=args.weights,
+                   hidden_dim=args.hidden_dim,
+                   num_layers=args.num_layers)

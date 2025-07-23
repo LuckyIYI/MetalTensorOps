@@ -3,68 +3,100 @@ using namespace metal;
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_numeric>
-#include "Shared.h"
 
 using namespace mpp;
-#define HIDDEN_DIM 128
+#define HIDDEN_DIM 64
+#define OUTPUT_DIM 3
+#define INPUT_DIM 2
 
-
-struct Tensors {
-    tensor<device half, dextents<int,2>> W[8];
-    tensor<device half, dextents<int,1>> B[8];
+struct MLPLayers {
+    tensor<device half, dextents<int,2>> W[16];
+    tensor<device half, dextents<int,1>> B[16];
 };
-
 
 kernel void mlp(
     texture2d<float, access::write> outTexture [[texture(0)]],
-    constant Tensors &layers [[buffer(0)]],
-    constant uint &layerCount  [[buffer(1)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    const half2 xy = (half2(gid)+0.5h)/half2(outTexture.get_width(),outTexture.get_height())*2.0h-1.0h;
-    
-    thread half vInMem[HIDDEN_DIM] = {xy.x, xy.y};
-    auto  vIn = tensor(vInMem, dextents<int,2>(HIDDEN_DIM,1));
+    constant MLPLayers &mlpLayers [[buffer(0)]],
+    constant uint &mlpLayerCount [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const half2 xy = (half2(gid) + 0.5h) / half2(outTexture.get_width(), outTexture.get_height()) * 2.0h - 1.0h;
 
-    thread half tmpHiddenMem[HIDDEN_DIM];
-    auto  tmpHidden = tensor(tmpHiddenMem, dextents<int,2>(HIDDEN_DIM,1));
+    thread half inputMem[HIDDEN_DIM] = { xy.x, xy.y }; // doesn't work when set to INPUT_DIM
+    auto input = tensor(inputMem, dextents<int,2>(HIDDEN_DIM, 1)); //  doesn't work when set to INPUT_DIM
 
-    thread half tmpOutMem[1];
-    auto  tmpOut = tensor(tmpOutMem, dextents<int,2>(1,1));
+    thread half hiddenMem[HIDDEN_DIM];
+    auto hidden = tensor(hiddenMem, dextents<int,2>(HIDDEN_DIM, 1));
 
-    constexpr half OMEGA0 = 10.0h;
+    // Use OUTPUT_DIM for output buffer size and tensor dimension
+    thread half outputMem[OUTPUT_DIM];
+    auto output = tensor(outputMem, dextents<int,2>(OUTPUT_DIM, 1));
 
-    constexpr tensor_ops::matmul2d_descriptor kHiddenDesc(
+    constexpr half FIRST_OMEGA0 = 30.0h;
+    constexpr half HIDDEN_OMEGA0 = 1.0h;
+
+    // Descriptor for first (input) layer multiplication
+    constexpr tensor_ops::matmul2d_descriptor inputDesc(
+        /* M N K */ 1, HIDDEN_DIM,  HIDDEN_DIM, //INPUT_DIM,
+        /* transpose */ false, false,
+        /* reduced-precision */ true
+    );
+
+    // Descriptor for hidden layers multiplication
+    constexpr tensor_ops::matmul2d_descriptor hiddenDesc(
         /* M N K */ 1, HIDDEN_DIM, HIDDEN_DIM,
         /* transpose */ false, false,
-        /* reduced-precision */ true);
+        /* reduced-precision */ true
+    );
 
-    constexpr tensor_ops::matmul2d_descriptor kOutDesc(
-        /* M N K */ 1, 1, HIDDEN_DIM,
+    // Descriptor for output layer multiplication
+    constexpr tensor_ops::matmul2d_descriptor outputDesc(
+        /* M N K */ 1, OUTPUT_DIM, HIDDEN_DIM,
         /* transpose */ false, false,
-        /* reduced-precision */ true);
-    
-    for (uint l = 0; l < layerCount; ++l) {
-        auto W = layers.W[l];
-        auto B = layers.B[l];
+        /* reduced-precision */ true
+    );
 
-        bool isLast = (l == layerCount - 1);
+    for (uint layerIndex = 0; layerIndex < mlpLayerCount; ++layerIndex) {
+        auto W = mlpLayers.W[layerIndex];
+        auto B = mlpLayers.B[layerIndex];
 
-        if (isLast) {
-            tensor_ops::matmul2d<kOutDesc, execution_thread>{}.run(vIn, W, tmpOut);
+        bool isLastLayer = (layerIndex == mlpLayerCount - 1);
+
+        if (layerIndex == 0) {
+            // First layer: input -> hidden
+            tensor_ops::matmul2d<inputDesc, execution_thread>{}.run(input, W, hidden);
+        } else
+            if (isLastLayer) {
+            // Last layer: hidden -> output
+            tensor_ops::matmul2d<outputDesc, execution_thread>{}.run(input, W, output);
         } else {
-            tensor_ops::matmul2d<kHiddenDesc, execution_thread>{}.run(vIn, W, tmpHidden);
+            // Hidden layers: hidden -> hidden
+            tensor_ops::matmul2d<hiddenDesc, execution_thread>{}.run(input, W, hidden);
         }
 
-        uint outDim = isLast ? 1 : HIDDEN_DIM;
-        for (uint i = 0; i < outDim; ++i) {
-            half val = (isLast ? tmpOut[i,0] : tmpHidden[i,0]) + B[i];
-            vIn[i,0] = isLast ? val : sin(OMEGA0 * val);
+        const uint outputDim = isLastLayer ? OUTPUT_DIM : HIDDEN_DIM;
+        for (uint i = 0; i < outputDim; ++i) {
+            half val = (isLastLayer ? output[i, 0] : hidden[i, 0]) + B[i];
+            if (isLastLayer) {
+                input[i, 0] = val;
+            } else if (layerIndex == 0) {
+                input[i, 0] = sin(FIRST_OMEGA0 * val);
+            } else {
+                input[i, 0] = sin(HIDDEN_OMEGA0 * val);
+            }
         }
     }
 
-    const half sdf = vIn[0,0];
-    float3 col = sin(sdf * 100.0h) * 0.5 + 0.5;
-    outTexture.write(float4(col,1.0), gid);
-}
+    float3 col;
+    if constexpr (OUTPUT_DIM == 1) {
+        const half sdf = input[0, 0];
+        col = sin(sdf * 100.0h) * 0.5 + 0.5;
+    } else if constexpr (OUTPUT_DIM == 3) {
+        float r = float(input[0, 0]);
+        float g = float(input[1, 0]);
+        float b = float(input[2, 0]);
+        col = float3(r, g, b) ;
+    }
 
+    outTexture.write(float4(col, 1.0), gid);
+}
