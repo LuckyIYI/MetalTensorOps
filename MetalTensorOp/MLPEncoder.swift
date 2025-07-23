@@ -11,7 +11,7 @@ struct MLPTensorArguments {
     }
 }
 
-class MetalEncoder {
+class MLPEncoder {
     let pipelineState: MTLComputePipelineState
     var argumentTable: any MTL4ArgumentTable
     let residencySet: MTLResidencySet
@@ -33,11 +33,14 @@ class MetalEncoder {
         tableDesc.maxTextureBindCount = 1
         tableDesc.maxBufferBindCount = 2
 
-        guard let url = Bundle.main.url(forResource: "weights", withExtension: "json") else {
-            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to locate weights.json"])
+        guard let url = Bundle.main.url(forResource: "model", withExtension: "json") else {
+            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to locate model.json"])
         }
         let data = try Data(contentsOf: url)
-        let mlp = try JSONDecoder().decode(MLP.self, from: data)
+        let model = try JSONDecoder().decode(ModelFile.self, from: data)
+        guard let mlp = model.mlp else {
+            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "No MLP found in model file"])
+        }
 
         self.mlp = mlp
         self.argumentTable = try device.makeArgumentTable(descriptor: tableDesc)
@@ -49,10 +52,10 @@ class MetalEncoder {
         var mlpTensorArguments = MLPTensorArguments()
 
         for i in 0..<mlp.layers.count {
-            mlpTensorArguments.weight[i] = mlp.layers[i].weights.gpuResourceID
+            mlpTensorArguments.weight[i] = mlp.layers[i].weightTensor.gpuResourceID
         }
         for i in 0..<mlp.layers.count {
-            mlpTensorArguments.bias[i] = mlp.layers[i].biases.gpuResourceID
+            mlpTensorArguments.bias[i] = mlp.layers[i].biasTensor.gpuResourceID
         }
 
         guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<MLPTensorArguments>.stride, options: .storageModeShared) else {
@@ -73,10 +76,8 @@ class MetalEncoder {
         queue.addResidencySet(residency)
 
         for layer in mlp.layers {
-            residency.addAllocation(layer.rawWeights)
-            residency.addAllocation(layer.rawBiases)
-            residency.addAllocation(layer.weights)
-            residency.addAllocation(layer.biases)
+            residency.addAllocation(layer.weightTensor)
+            residency.addAllocation(layer.biasTensor)
             residency.addAllocation(layerCountBuffer)
         }
 
@@ -101,3 +102,4 @@ class MetalEncoder {
         encoder.endEncoding()
     }
 }
+

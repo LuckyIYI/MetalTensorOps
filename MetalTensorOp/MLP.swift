@@ -1,28 +1,24 @@
 import Foundation
 import Metal
 
-
-struct Layer: Codable {
-    let weights: MTLTensor
-    let biases: MTLTensor
-    
-    let rawWeights: MTLBuffer
-    let rawBiases: MTLBuffer
+struct MLPParameterLayer: Codable {
+    let weightTensor: MTLTensor
+    let biasTensor: MTLTensor
 
     private enum CodingKeys: String, CodingKey {
-        case weight
-        case bias
+        case weights
+        case biases
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
 
-        let weightMatrix = try container.decode([[Float16]].self, forKey: .weight)
-        let biasVector = try container.decode([Float16].self,  forKey: .bias)
+        let weightMatrix = try container.decode([[Float16]].self, forKey: .weights)
+        let biasVector = try container.decode([Float16].self,  forKey: .biases)
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw DecodingError.dataCorruptedError(
-                forKey: .weight,
+                forKey: .weights,
                 in: container,
                 debugDescription: "Metal device unavailable")
         }
@@ -30,10 +26,9 @@ struct Layer: Codable {
         let rows = weightMatrix.count
         let cols = weightMatrix.first?.count ?? 0
 
-        // ---- Weights --------------------------------------------------------
         guard let wExtents = MTLTensorExtents([rows, cols]) else {
             throw DecodingError.dataCorruptedError(
-                forKey: .weight,
+                forKey: .weights,
                 in: container,
                 debugDescription: "Invalid weight extents")
         }
@@ -54,11 +49,9 @@ struct Layer: Codable {
 
         let wTensor = try wBuffer.makeTensor(descriptor: wDesc, offset: 0)
 
-
-        // ---- Biases ---------------------------------------------------------
         guard let bExtents = MTLTensorExtents([biasVector.count]) else {
             throw DecodingError.dataCorruptedError(
-                forKey: .bias,
+                forKey: .biases,
                 in: container,
                 debugDescription: "Invalid bias extents")
         }
@@ -72,27 +65,24 @@ struct Layer: Codable {
         let bBuffer = device.makeBuffer(bytes: flatB, length: flatB.count * MemoryLayout<Float16>.stride)!
         let bTensor = try bBuffer.makeTensor(descriptor: bDesc, offset: 0)
 
-        self.weights = wTensor
-        self.biases  = bTensor
-        self.rawWeights = wBuffer
-        self.rawBiases  = bBuffer
+        self.weightTensor = wTensor
+        self.biasTensor  = bTensor
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
 
-        // ---- Weights --------------------------------------------------------
-        let dims = weights.dimensions.extents
+        let dims = weightTensor.dimensions.extents
         let rows = dims[0]
         let cols = dims[1]
         let dstStrides = MTLTensorExtents([cols, 1])!
         let count = rows * cols
         var flatW = [Float16](repeating: 0, count: count)
-        weights.getBytes(
+        weightTensor.getBytes(
             &flatW,
             strides: dstStrides,
             sliceOrigin: MTLTensorExtents([0, 0])!,
-            sliceDimensions: weights.dimensions)
+            sliceDimensions: weightTensor.dimensions)
         
         var matrix: [[Float16]] = []
         matrix.reserveCapacity(rows)
@@ -100,42 +90,43 @@ struct Layer: Codable {
             let start = r * cols
             matrix.append(Array(flatW[start ..< start + cols]))
         }
-        try container.encode(matrix, forKey: .weight)
+        try container.encode(matrix, forKey: .weights)
 
-        // ---- Biases ---------------------------------------------------------
-        let biasCount = biases.dimensions.extents[0]
+        let biasCount = biasTensor.dimensions.extents[0]
         var biasArray = [Float16](repeating: 0, count: biasCount)
-        biases.getBytes(
+        biasTensor.getBytes(
             &biasArray,
-            strides: biases.strides,
+            strides: biasTensor.strides,
             sliceOrigin: MTLTensorExtents([0])!,
-            sliceDimensions: biases.dimensions)
+            sliceDimensions: biasTensor.dimensions)
 
-        try container.encode(biasArray, forKey: .bias)
+        try container.encode(biasArray, forKey: .biases)
     }
 }
 
-/// A simple multi‑layer perceptron composed of several `Layer`s.
 struct MLP: Codable {
-    var layers: [Layer]
+    var layers: [MLPParameterLayer]
 
-    private enum CodingKeys: String, CodingKey { case layers }
+    private enum CodingKeys: String, CodingKey {
+        case layers
+    }
 
-    init(layers: [Layer]) { self.layers = layers }
+    init(layers: [MLPParameterLayer]) {
+        self.layers = layers
+    }
 
     init(from decoder: Decoder) throws {
         if let keyed = try? decoder.container(keyedBy: CodingKeys.self),
            keyed.contains(.layers) {
-            self.layers = try keyed.decode([Layer].self, forKey: .layers)
-            return
+            self.layers = try keyed.decode([MLPParameterLayer].self, forKey: .layers)
+        } else {
+            let single = try decoder.singleValueContainer()
+            self.layers = try single.decode([MLPParameterLayer].self)
         }
-
-        let single = try decoder.singleValueContainer()
-        self.layers = try single.decode([Layer].self)
     }
 
     func encode(to encoder: Encoder) throws {
-        var single = encoder.singleValueContainer()
-        try single.encode(layers)
+        var keyed = encoder.container(keyedBy: CodingKeys.self)
+        try keyed.encode(layers, forKey: .layers)
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import Metal
 import MetalKit
 
@@ -10,7 +11,14 @@ import UIKit
 
 #if os(macOS)
 struct MetalCircleView: NSViewRepresentable {
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    var coordinator: Coordinator
+
+    init(coordinator: Coordinator) {
+        self.coordinator = coordinator
+    }
+
+    func makeCoordinator() -> Coordinator { coordinator }
+
     func makeNSView(context: Context) -> MTKView {
         let mtkView = MTKView()
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -21,15 +29,30 @@ struct MetalCircleView: NSViewRepresentable {
         mtkView.framebufferOnly = false
         mtkView.delegate = context.coordinator
         mtkView.clearColor = .init(red: 1, green: 1, blue: 1, alpha: 1)
+
         context.coordinator.setup(device: device, mtkView: mtkView)
+
+        if let width = context.coordinator.imageWidth, let height = context.coordinator.imageHeight {
+            mtkView.drawableSize = CGSize(width: width, height: height)
+        } else {
+            mtkView.drawableSize = CGSize(width: 512, height: 512)
+        }
 
         return mtkView
     }
+
     func updateNSView(_ nsView: MTKView, context: Context) {}
 }
 #else
 struct MetalCircleView: UIViewRepresentable {
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    var coordinator: Coordinator
+
+    init(coordinator: Coordinator) {
+        self.coordinator = coordinator
+    }
+
+    func makeCoordinator() -> Coordinator { coordinator }
+
     func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView()
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -40,24 +63,47 @@ struct MetalCircleView: UIViewRepresentable {
         mtkView.framebufferOnly = false
         mtkView.delegate = context.coordinator
         mtkView.clearColor = .init(red: 1, green: 1, blue: 1, alpha: 1)
+
         context.coordinator.setup(device: device, mtkView: mtkView)
+
+        if let width = context.coordinator.imageWidth, let height = context.coordinator.imageHeight {
+            mtkView.drawableSize = CGSize(width: width, height: height)
+        } else {
+            mtkView.drawableSize = CGSize(width: 512, height: 512)
+        }
 
         return mtkView
     }
+
     func updateUIView(_ uiView: MTKView, context: Context) {}
 }
 #endif
 
 @available(macOS 26.0, iOS 16.0, *)
-class Coordinator: NSObject, MTKViewDelegate {
+class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     var device: MTLDevice?
     var commandQueue: MTL4CommandQueue?
     var commandAllocator: MTL4CommandAllocator?
-    var encoder: MetalEncoder?
+    var encoder: MLPEncoder?
     var commandBuffer: MTL4CommandBuffer?
     var compiler: MTL4Compiler?
 
+    @Published var imageWidth: Int?
+    @Published var imageHeight: Int?
+    @Published var aspectRatio: CGFloat?
+
     private var drawingEnabled = false
+
+    struct ModelFile: Decodable {
+        struct Metadata: Decodable {
+            struct ImageMetadata: Decodable {
+                let width: Int?
+                let height: Int?
+            }
+            let image: ImageMetadata?
+        }
+        let metadata: Metadata?
+    }
 
     func setup(device: MTLDevice, mtkView: MTKView) {
         self.device = device
@@ -100,11 +146,24 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
 
         do {
-            encoder = try MetalEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
+            encoder = try MLPEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
         } catch {
-            print("[Coordinator] Failed to initialize MetalEncoder: \(error)")
+            print("[Coordinator] Failed to initialize MLPEncoder: \(error)")
             drawingEnabled = false
             return
+        }
+
+        // Extracting image metadata from the model JSON file
+        if let url = Bundle.main.url(forResource: "model", withExtension: "json") {
+            if let data = try? Data(contentsOf: url),
+               let model = try? JSONDecoder().decode(ModelFile.self, from: data),
+               let imageMeta = model.metadata?.image {
+                if let width = imageMeta.width, let height = imageMeta.height {
+                    self.imageWidth = width
+                    self.imageHeight = height
+                    self.aspectRatio = CGFloat(width) / CGFloat(height)
+                }
+            }
         }
 
         guard let commandBuffer = device.makeCommandBuffer() else {
@@ -122,7 +181,11 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         commandQueue.addResidencySet(metalLayer.residencySet)
 
-        mtkView.drawableSize = CGSize(width: 512, height: 512)
+        if let width = imageWidth, let height = imageHeight {
+            mtkView.drawableSize = CGSize(width: width, height: height)
+        } else {
+            mtkView.drawableSize = CGSize(width: 512, height: 512)
+        }
 
         drawingEnabled = true
     }
@@ -170,9 +233,14 @@ class Coordinator: NSObject, MTKViewDelegate {
 
 @available(macOS 26.0, iOS 16.0, *)
 struct ContentView: View {
+    @StateObject var coordinator = Coordinator()
+
     var body: some View {
-        MetalCircleView()
-            .frame(width: 512, height: 512)
+        let width = coordinator.imageWidth.map { CGFloat($0) } ?? 512
+        let height = coordinator.imageHeight.map { CGFloat($0) } ?? 512
+
+        MetalCircleView(coordinator: coordinator)
+            .frame(width: width, height: height)
             .padding()
     }
 }

@@ -10,8 +10,8 @@ using namespace mpp;
 #define INPUT_DIM 2
 
 struct MLPLayers {
-    tensor<device half, dextents<int,2>> W[16];
-    tensor<device half, dextents<int,1>> B[16];
+    tensor<device half, dextents<int, 2>> W[16];
+    tensor<device half, dextents<int, 1>> B[16];
 };
 
 kernel void mlp(
@@ -23,21 +23,21 @@ kernel void mlp(
     const half2 xy = (half2(gid) + 0.5h) / half2(outTexture.get_width(), outTexture.get_height()) * 2.0h - 1.0h;
 
     thread half inputMem[HIDDEN_DIM] = { xy.x, xy.y }; // doesn't work when set to INPUT_DIM
-    auto input = tensor(inputMem, dextents<int,2>(HIDDEN_DIM, 1)); //  doesn't work when set to INPUT_DIM
+    auto input = tensor(inputMem, dextents<int, 2>(HIDDEN_DIM, 1)); //  doesn't work when set to INPUT_DIM
 
     thread half hiddenMem[HIDDEN_DIM];
-    auto hidden = tensor(hiddenMem, dextents<int,2>(HIDDEN_DIM, 1));
+    auto hidden = tensor(hiddenMem, dextents<int, 2>(HIDDEN_DIM, 1));
 
     // Use OUTPUT_DIM for output buffer size and tensor dimension
     thread half outputMem[OUTPUT_DIM];
-    auto output = tensor(outputMem, dextents<int,2>(OUTPUT_DIM, 1));
+    auto output = tensor(outputMem, dextents<int, 2>(OUTPUT_DIM, 1));
 
     constexpr half FIRST_OMEGA0 = 30.0h;
     constexpr half HIDDEN_OMEGA0 = 1.0h;
 
     // Descriptor for first (input) layer multiplication
     constexpr tensor_ops::matmul2d_descriptor inputDesc(
-        /* M N K */ 1, HIDDEN_DIM,  HIDDEN_DIM, //INPUT_DIM,
+        /* M N K */ 1, HIDDEN_DIM,  INPUT_DIM,
         /* transpose */ false, false,
         /* reduced-precision */ true
     );
