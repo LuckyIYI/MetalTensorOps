@@ -103,7 +103,7 @@ class SIREN(nn.Module):
         return self.net(x)
 
 class FourierFeatureLayer(nn.Module):
-    def __init__(self, in_dim, num_frequencies=256, sigma=10.0):
+    def __init__(self, in_dim, num_frequencies, sigma=10.0):
         super().__init__()
         self.B = nn.Parameter(torch.randn(in_dim, num_frequencies) * sigma, requires_grad=False)
         self.sigma = sigma
@@ -112,7 +112,7 @@ class FourierFeatureLayer(nn.Module):
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 class FourierMLP(nn.Module):
-    def __init__(self, hidden_dim, num_layers, out_dim, num_frequencies=256, sigma=10.0):
+    def __init__(self, hidden_dim, num_layers, out_dim, num_frequencies, sigma=10.0):
         super().__init__()
         self.ff = FourierFeatureLayer(2, num_frequencies, sigma)
         layers = [nn.Linear(num_frequencies*2, hidden_dim), nn.ReLU()]
@@ -188,7 +188,7 @@ def train_and_show(coords, targets, out_dim, shape_or_res, steps, lr, weights_pa
     if out_dim == 1:
         Y = Y.unsqueeze(1)
     if model_type == 'fourier':
-        net = FourierMLP(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim, num_frequencies=256, sigma=10.0).to(device)
+        net = FourierMLP(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim, num_frequencies=128, sigma=10.0).to(device)
     else:
         net = SIREN(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim).to(device)
     optim = torch.optim.Adam(net.parameters(), lr=lr)

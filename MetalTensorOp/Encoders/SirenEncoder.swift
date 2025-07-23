@@ -1,7 +1,13 @@
-// This file only implements SirenEncoder. FourierEncoder is implemented separately.
-
 import Metal
 import Foundation
+
+enum SirenEncoderError: Error {
+    case failedToLocateModelJson(String)
+    case noMLPFoundInModelFile
+    case failedToCreateTensorArgumentsBuffer
+    case failedToCreateLayerCountBuffer
+}
+
 
 struct MLPTensorArguments {
     var weight: StaticArray16<MTLResourceID>
@@ -39,13 +45,13 @@ final class SirenEncoder: ComputeEncoder {
         let fileName = "siren"
         
         guard let url = Bundle.main.url(forResource: fileName, withExtension: "json") else {
-            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to locate \(fileName).json"])
+            throw SirenEncoderError.failedToLocateModelJson(fileName)
         }
         let data = try Data(contentsOf: url)
         
         let sirenModel = try JSONDecoder().decode(SirenModel.self, from: data)
         guard let mlp = sirenModel.mlp else {
-            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "No MLP found in siren model file"])
+            throw SirenEncoderError.noMLPFoundInModelFile
         }
         self.mlp = mlp
         
@@ -65,13 +71,13 @@ final class SirenEncoder: ComputeEncoder {
         }
 
         guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<MLPTensorArguments>.stride, options: .storageModeShared) else {
-            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to create tensorArgumentsBuffer"])
+            throw SirenEncoderError.failedToCreateTensorArgumentsBuffer
         }
         memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<MLPTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
         guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size) else {
-            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to create layerCountBuffer"])
+            throw SirenEncoderError.failedToCreateLayerCountBuffer
         }
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
 

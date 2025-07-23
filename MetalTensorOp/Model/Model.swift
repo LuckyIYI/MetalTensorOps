@@ -1,7 +1,6 @@
 import Foundation
 import Metal
 
-
 struct SirenModel: Codable {
     let metadata: Metadata?
     let mlp: MLP?
@@ -117,6 +116,7 @@ struct FourierParams: Codable {
 
         var flatB = [Float]()
         flatB.reserveCapacity(rows * cols)
+        
         // Transpose from row-major (list of lists) to column-major for the buffer
         for c in 0..<cols {
             for r in 0..<rows {

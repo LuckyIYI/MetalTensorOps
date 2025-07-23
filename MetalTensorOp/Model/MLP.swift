@@ -1,6 +1,13 @@
 import Foundation
 import Metal
 
+enum MLPError: Error {
+    case metalDeviceUnavailable
+    case invalidWeightExtents
+    case invalidBiasExtents
+}
+
+
 struct MLPParameterLayer: Codable {
     let weightTensor: MTLTensor
     let biasTensor: MTLTensor
@@ -17,20 +24,14 @@ struct MLPParameterLayer: Codable {
         let biasVector = try container.decode([Float16].self,  forKey: .biases)
 
         guard let device = MTLCreateSystemDefaultDevice() else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .weights,
-                in: container,
-                debugDescription: "Metal device unavailable")
+            throw MLPError.metalDeviceUnavailable
         }
 
         let rows = weightMatrix.count
         let cols = weightMatrix.first?.count ?? 0
 
         guard let wExtents = MTLTensorExtents([rows, cols]) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .weights,
-                in: container,
-                debugDescription: "Invalid weight extents")
+            throw MLPError.invalidWeightExtents
         }
         let wDesc = MTLTensorDescriptor()
         wDesc.dimensions = wExtents
@@ -50,10 +51,7 @@ struct MLPParameterLayer: Codable {
         let wTensor = try wBuffer.makeTensor(descriptor: wDesc, offset: 0)
 
         guard let bExtents = MTLTensorExtents([biasVector.count]) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .biases,
-                in: container,
-                debugDescription: "Invalid bias extents")
+            throw MLPError.invalidBiasExtents
         }
         let bDesc = MTLTensorDescriptor()
         bDesc.usage = .compute

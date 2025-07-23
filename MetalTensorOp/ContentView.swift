@@ -99,7 +99,7 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     var device: MTLDevice?
     var commandQueue: MTL4CommandQueue?
     var commandAllocator: MTL4CommandAllocator?
-    var encoder: ComputeEncoder?  // Protocol type for compute encoders
+    var encoder: ComputeEncoder?
     var commandBuffer: MTL4CommandBuffer?
     var compiler: MTL4Compiler?
 
@@ -109,7 +109,6 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
 
     private var drawingEnabled = false
 
-    // The model kind to determine which encoder to instantiate
     let modelKind: ModelKind
 
     init(modelKind: ModelKind = .siren) {
@@ -168,7 +167,6 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
             return
         }
 
-        // Select encoder based on modelKind
         do {
             switch modelKind {
             case .siren:

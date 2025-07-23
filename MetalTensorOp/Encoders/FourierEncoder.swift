@@ -1,11 +1,21 @@
 import Metal
 import Foundation
 
+enum FourierEncoderError: Error {
+    case failedToLocateModelJson
+    case noMLPFoundInModelFile
+    case fourierParamsMissing
+    case failedToCreateTensorArgumentsBuffer
+    case failedToCreateLayerCountBuffer
+    case failedToCreateSigmaBuffer
+}
+
+
 struct FourierTensorArguments {
     var weight: StaticArray16<MTLResourceID>
     var bias: StaticArray16<MTLResourceID>
     var bMatrix: MTLResourceID
-    // Add Fourier-specific arguments if desired
+
     init() {
         weight = .init(repeating: .init())
         bias = .init(repeating: .init())
@@ -33,12 +43,12 @@ final class FourierEncoder: ComputeEncoder {
         tableDesc.maxBufferBindCount = 4
 
         guard let url = Bundle.main.url(forResource: "fourier", withExtension: "json") else {
-            throw NSError(domain: "FourierEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to locate model.json"])
+            throw FourierEncoderError.failedToLocateModelJson
         }
         let data = try Data(contentsOf: url)
         let fourierModel = try JSONDecoder().decode(FourierModel.self, from: data)
         guard let mlp = fourierModel.mlp else {
-            throw NSError(domain: "FourierEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "No MLP found in Fourier model file"])
+            throw FourierEncoderError.noMLPFoundInModelFile
         }
         let fourier = fourierModel.fourier
         self.mlp = mlp
@@ -53,31 +63,27 @@ final class FourierEncoder: ComputeEncoder {
             mlpTensorArguments.bias[i] = mlp.layers[i].biasTensor.gpuResourceID
         }
         guard let sigma = fourier.sigma else {
-            throw NSError(domain: "FourierEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "FourierParams missing sigma"])
+            throw FourierEncoderError.fourierParamsMissing
         }
 
         mlpTensorArguments.bMatrix = fourier.bTensor.gpuResourceID
 
         guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<FourierTensorArguments>.stride, options: .storageModeShared) else {
-            throw NSError(domain: "FourierEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to create tensorArgumentsBuffer"])
+            throw FourierEncoderError.failedToCreateTensorArgumentsBuffer
         }
         memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<FourierTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
         guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size) else {
-            throw NSError(domain: "FourierEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to create layerCountBuffer"])
+            throw FourierEncoderError.failedToCreateLayerCountBuffer
         }
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
 
         guard let sigmaBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
-            throw NSError(domain: "FourierEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to create sigmaBuffer"])
+            throw FourierEncoderError.failedToCreateSigmaBuffer
         }
         var sigmaCopy = sigma
         memcpy(sigmaBuffer.contents(), &sigmaCopy, MemoryLayout<Float>.stride)
-
-        guard let sigmaBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
-            throw NSError(domain: "FourierEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to create sigmaBuffer"])
-        }
 
         self.argumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
         self.argumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
@@ -91,8 +97,7 @@ final class FourierEncoder: ComputeEncoder {
         }
         residency.addAllocation(layerCountBuffer)
         residency.addAllocation(fourier.bTensor)
-        residency.addAllocation(sigmaBuffer)
-        residency.addAllocation(sigmaBuffer)
+        
         residency.commit()
         self.residencySet = residency
     }

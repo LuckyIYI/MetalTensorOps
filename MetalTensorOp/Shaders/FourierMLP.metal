@@ -5,9 +5,8 @@ using namespace metal;
 #include <metal_numeric>
 using namespace mpp;
 
-
-#define IN_DIM 2
-#define NUM_FREQ 256
+#define INPUT_DIM 2
+#define NUM_FREQ 128
 #define HIDDEN_DIM 64
 #define OUTPUT_DIM 3
 
@@ -24,8 +23,6 @@ kernel void fourierMLP(
     constant float &sigma [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    // Parameters
-
     const int fourierDim = NUM_FREQ * 2;
     // 1. Compute normalized input coords
     float2 xy = (float2(gid) + 0.5f) / float2(outTexture.get_width(), outTexture.get_height()) * 2.0f - 1.0f;
@@ -34,7 +31,7 @@ kernel void fourierMLP(
     thread float fourierFeature[fourierDim];
     for (int i = 0; i < NUM_FREQ; ++i) {
         float proj = 0.0f;
-        for (int j = 0; j < IN_DIM; ++j) {
+        for (int j = 0; j < INPUT_DIM; ++j) {
             proj += xy[j] * mlpLayers.BMatrix[j, i];
         }
         proj *= 2.0f * float(M_PI_F);
@@ -89,7 +86,7 @@ kernel void fourierMLP(
     float3 col;
     if constexpr (OUTPUT_DIM == 1) {
         const half sdf = current_activation[0];
-        col = sin(float(sdf) * 100.0f) * 0.5f + 0.5f;
+        col = sin(float(sdf) * 1.0f) * 0.5f + 0.5f;
     } else if constexpr (OUTPUT_DIM == 3) {
         float r = float(current_activation[0]);
         float g = float(current_activation[1]);

@@ -3,11 +3,11 @@ using namespace metal;
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_numeric>
-
 using namespace mpp;
+
+#define INPUT_DIM 2
 #define HIDDEN_DIM 64
 #define OUTPUT_DIM 3
-#define INPUT_DIM 2
 
 struct MLPLayers {
     tensor<device half, dextents<int, 2>> W[16];
@@ -28,33 +28,15 @@ kernel void sirenMLP(
     thread half hiddenMem[HIDDEN_DIM];
     auto hidden = tensor(hiddenMem, dextents<int, 2>(HIDDEN_DIM, 1));
 
-    // Use OUTPUT_DIM for output buffer size and tensor dimension
     thread half outputMem[OUTPUT_DIM];
     auto output = tensor(outputMem, dextents<int, 2>(OUTPUT_DIM, 1));
 
     constexpr half FIRST_OMEGA0 = 30.0h;
     constexpr half HIDDEN_OMEGA0 = 1.0h;
 
-    // Descriptor for first (input) layer multiplication
-    constexpr tensor_ops::matmul2d_descriptor inputDesc(
-        /* M N K */ 1, HIDDEN_DIM,  INPUT_DIM,
-        /* transpose */ false, false,
-        /* reduced-precision */ true
-    );
-
-    // Descriptor for hidden layers multiplication
-    constexpr tensor_ops::matmul2d_descriptor hiddenDesc(
-        /* M N K */ 1, HIDDEN_DIM, HIDDEN_DIM,
-        /* transpose */ false, false,
-        /* reduced-precision */ true
-    );
-
-    // Descriptor for output layer multiplication
-    constexpr tensor_ops::matmul2d_descriptor outputDesc(
-        /* M N K */ 1, OUTPUT_DIM, HIDDEN_DIM,
-        /* transpose */ false, false,
-        /* reduced-precision */ true
-    );
+    constexpr tensor_ops::matmul2d_descriptor inputDesc(1, HIDDEN_DIM,  INPUT_DIM, false, false, true);
+    constexpr tensor_ops::matmul2d_descriptor hiddenDesc(1, HIDDEN_DIM, HIDDEN_DIM, false, false, true);
+    constexpr tensor_ops::matmul2d_descriptor outputDesc(1, OUTPUT_DIM, HIDDEN_DIM, false, false, true);
 
     for (uint layerIndex = 0; layerIndex < mlpLayerCount; ++layerIndex) {
         auto W = mlpLayers.W[layerIndex];

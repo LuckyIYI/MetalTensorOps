@@ -1,4 +1,3 @@
-// Create a new Swift file for StaticArray16, modeled on StaticArray8 but supporting 16 elements.
 import Foundation
 
 public struct StaticArray16<T> {
