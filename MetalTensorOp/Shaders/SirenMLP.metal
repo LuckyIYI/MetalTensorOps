@@ -14,7 +14,7 @@ struct MLPLayers {
     tensor<device half, dextents<int, 1>> B[16];
 };
 
-kernel void mlp(
+kernel void sirenMLP(
     texture2d<float, access::write> outTexture [[texture(0)]],
     constant MLPLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],

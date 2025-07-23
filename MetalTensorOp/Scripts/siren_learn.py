@@ -102,10 +102,32 @@ class SIREN(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class FourierFeatureLayer(nn.Module):
+    def __init__(self, in_dim, num_frequencies=256, sigma=10.0):
+        super().__init__()
+        self.B = nn.Parameter(torch.randn(in_dim, num_frequencies) * sigma, requires_grad=False)
+        self.sigma = sigma
+    def forward(self, x):
+        x_proj = 2 * math.pi * x @ self.B
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+class FourierMLP(nn.Module):
+    def __init__(self, hidden_dim, num_layers, out_dim, num_frequencies=256, sigma=10.0):
+        super().__init__()
+        self.ff = FourierFeatureLayer(2, num_frequencies, sigma)
+        layers = [nn.Linear(num_frequencies*2, hidden_dim), nn.ReLU()]
+        for _ in range(num_layers-1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        self.net = nn.Sequential(*layers)
+    def forward(self, x):
+        x = self.ff(x)
+        return self.net(x)
+
 def export_weights(net, path, metadata=None):
     import json
     layers = []
-    for layer in net.net:
+    for layer in getattr(net, "net", []):
         if isinstance(layer, nn.Linear):
             lin = layer
         elif hasattr(layer, "lin") and isinstance(layer.lin, nn.Linear):
@@ -124,6 +146,12 @@ def export_weights(net, path, metadata=None):
         },
         "metadata": {}
     }
+    # Add Fourier params if present
+    if hasattr(net, "ff") and hasattr(net.ff, "B"):
+        out["fourier"] = {
+            "B": net.ff.B.detach().cpu().numpy().tolist(),
+            "sigma": net.ff.sigma,
+        }
     # Restructure metadata to match Swift Metadata struct if provided
     if metadata is not None:
         mode = metadata.get("mode", None)
@@ -133,33 +161,36 @@ def export_weights(net, path, metadata=None):
                 "height": metadata.get("height"),
                 "aspect_ratio": metadata.get("aspect_ratio"),
             }
-            out["metadata"] = {
+            out["metadata"].update({
                 "mode": "image",
                 "image": image_meta
-            }
+            })
         elif mode == "sdf":
             sdf_meta = {
                 "resolution": metadata.get("resolution")
             }
-            out["metadata"] = {
+            out["metadata"].update({
                 "mode": "sdf",
                 "sdf": sdf_meta
-            }
+            })
         else:
-            out["metadata"] = metadata
+            out["metadata"].update(metadata)
     with open(path, "w") as f:
         json.dump(out, f)
 
 # -----------------------------------------------------------------------------
 # 4. Training loop and plotting
 # -----------------------------------------------------------------------------
-def train_and_show(coords, targets, out_dim, shape_or_res, steps, lr, weights_path, hidden_dim, num_layers, metadata):
+def train_and_show(coords, targets, out_dim, shape_or_res, steps, lr, weights_path, hidden_dim, num_layers, metadata, model_type='siren'):
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     X = torch.tensor(coords, dtype=torch.float32, device=device)
     Y = torch.tensor(targets, dtype=torch.float32, device=device)
     if out_dim == 1:
         Y = Y.unsqueeze(1)
-    net = SIREN(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim).to(device)
+    if model_type == 'fourier':
+        net = FourierMLP(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim, num_frequencies=256, sigma=10.0).to(device)
+    else:
+        net = SIREN(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim).to(device)
     optim = torch.optim.Adam(net.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=steps)
     mse = nn.MSELoss()
@@ -198,6 +229,7 @@ def main():
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--svg", help="SVG file to learn (SDF mode)")
     group.add_argument("--image", help="Image file to learn (image mode)")
+    ap.add_argument("--fourier", action='store_true', help="Use Fourier feature MLP instead of SIREN")
     ap.add_argument("--res", type=int, default=64, help="grid resolution for SDF mode (default: 64)")
     ap.add_argument("--max_dim", type=int, default=64, help="image max dim for image mode (default: 64)")
     ap.add_argument("--weights", default="model.json", help="where to write trained model (default: model.json)")
@@ -206,6 +238,11 @@ def main():
     ap.add_argument("--num_layers", type=int, default=8, help="number of SIREN hidden layers (default: 3)")
     ap.add_argument("--lr", type=float, default=1e-3, help="learning rate (default: 1e-3)")
     args = ap.parse_args()
+
+    if not ("--weights" in [a for a in vars(args) if getattr(args, a) == args.weights] and args.weights != "model.json"):
+        if args.weights == "model.json":
+            args.weights = "fourier.json" if args.fourier else "siren.json"
+    model_type = 'fourier' if args.fourier else 'siren'
     if args.svg is not None:
         poly = sample_svg(args.svg)
         coords, sdf = sdf_from_poly(poly, res=args.res)
@@ -218,7 +255,8 @@ def main():
                        weights_path=args.weights,
                        hidden_dim=args.hidden_dim,
                        num_layers=args.num_layers,
-                       metadata=metadata)
+                       metadata=metadata,
+                       model_type=model_type)
     elif args.image is not None:
         coords, rgb, w, h = sample_image(args.image, max_dim=args.max_dim)
         metadata = {
@@ -232,7 +270,8 @@ def main():
                        weights_path=args.weights,
                        hidden_dim=args.hidden_dim,
                        num_layers=args.num_layers,
-                       metadata=metadata)
+                       metadata=metadata,
+                       model_type=model_type)
 
 if __name__ == "__main__":
     main()

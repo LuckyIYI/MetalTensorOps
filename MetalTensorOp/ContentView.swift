@@ -3,6 +3,21 @@ import Combine
 import Metal
 import MetalKit
 
+struct ModelKindKey: EnvironmentKey {
+    static let defaultValue: ModelKind = .siren
+}
+
+extension EnvironmentValues {
+    var modelKind: ModelKind {
+        get { self[ModelKindKey.self] }
+        set { self[ModelKindKey.self] = newValue }
+    }
+}
+
+protocol ComputeEncoder {
+    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer)
+}
+
 #if os(macOS)
 import AppKit
 #elseif os(iOS)
@@ -84,7 +99,7 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     var device: MTLDevice?
     var commandQueue: MTL4CommandQueue?
     var commandAllocator: MTL4CommandAllocator?
-    var encoder: MLPEncoder?
+    var encoder: ComputeEncoder?  // Protocol type for compute encoders
     var commandBuffer: MTL4CommandBuffer?
     var compiler: MTL4Compiler?
 
@@ -93,6 +108,14 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     @Published var aspectRatio: CGFloat?
 
     private var drawingEnabled = false
+
+    // The model kind to determine which encoder to instantiate
+    let modelKind: ModelKind
+
+    init(modelKind: ModelKind = .siren) {
+        self.modelKind = modelKind
+        super.init()
+    }
 
     struct ModelFile: Decodable {
         struct Metadata: Decodable {
@@ -145,16 +168,21 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
             return
         }
 
+        // Select encoder based on modelKind
         do {
-            encoder = try MLPEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
+            switch modelKind {
+            case .siren:
+                encoder = try SirenEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
+            case .fourier:
+                encoder = try FourierEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
+            }
         } catch {
-            print("[Coordinator] Failed to initialize MLPEncoder: \(error)")
+            print("[Coordinator] Failed to initialize encoder for \(modelKind): \(error)")
             drawingEnabled = false
             return
         }
 
-        // Extracting image metadata from the model JSON file
-        if let url = Bundle.main.url(forResource: "model", withExtension: "json") {
+        if let url = Bundle.main.url(forResource: modelKind == .fourier ? "fourier" : "siren", withExtension: "json") {
             if let data = try? Data(contentsOf: url),
                let model = try? JSONDecoder().decode(ModelFile.self, from: data),
                let imageMeta = model.metadata?.image {
@@ -233,18 +261,21 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
 
 @available(macOS 26.0, iOS 16.0, *)
 struct ContentView: View {
-    @StateObject var coordinator = Coordinator()
+    @Environment(\.modelKind) private var modelKind
 
     var body: some View {
+        let coordinator = Coordinator(modelKind: modelKind)
         let width = coordinator.imageWidth.map { CGFloat($0) } ?? 512
         let height = coordinator.imageHeight.map { CGFloat($0) } ?? 512
 
         MetalCircleView(coordinator: coordinator)
             .frame(width: width, height: height)
             .padding()
+            .id(modelKind)
     }
 }
 
 #Preview {
     ContentView()
+        .environment(\.modelKind, .siren) // or .fourier for preview purposes
 }

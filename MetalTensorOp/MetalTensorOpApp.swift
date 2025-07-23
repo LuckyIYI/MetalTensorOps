@@ -1,10 +1,16 @@
 import SwiftUI
 
+enum ModelKind {
+    case siren
+    case fourier
+}
+
 @main
 struct MetalTensorOpApp: App {
+    
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView().environment(\.modelKind, .fourier)
         }
     }
 }

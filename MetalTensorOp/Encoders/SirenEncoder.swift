@@ -1,3 +1,5 @@
+// This file only implements SirenEncoder. FourierEncoder is implemented separately.
+
 import Metal
 import Foundation
 
@@ -11,15 +13,16 @@ struct MLPTensorArguments {
     }
 }
 
-class MLPEncoder {
+final class SirenEncoder: ComputeEncoder {
     let pipelineState: MTLComputePipelineState
     var argumentTable: any MTL4ArgumentTable
     let residencySet: MTLResidencySet
     let mlp: MLP
 
+
     init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
-        functionDescriptor.name = "mlp"
+        functionDescriptor.name = "sirenMLP"
         functionDescriptor.library = library
         
         let pipelineDescriptor = MTL4ComputePipelineDescriptor()
@@ -32,17 +35,20 @@ class MLPEncoder {
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
         tableDesc.maxBufferBindCount = 2
-
-        guard let url = Bundle.main.url(forResource: "model", withExtension: "json") else {
-            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to locate model.json"])
+        
+        let fileName = "siren"
+        
+        guard let url = Bundle.main.url(forResource: fileName, withExtension: "json") else {
+            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "Failed to locate \(fileName).json"])
         }
         let data = try Data(contentsOf: url)
-        let model = try JSONDecoder().decode(ModelFile.self, from: data)
-        guard let mlp = model.mlp else {
-            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "No MLP found in model file"])
+        
+        let sirenModel = try JSONDecoder().decode(SirenModel.self, from: data)
+        guard let mlp = sirenModel.mlp else {
+            throw NSError(domain: "MetalEncoder", code: -1, userInfo: [NSLocalizedDescriptionKey : "No MLP found in siren model file"])
         }
-
         self.mlp = mlp
+        
         self.argumentTable = try device.makeArgumentTable(descriptor: tableDesc)
 
         let desc = MTL4ArgumentTableDescriptor()
