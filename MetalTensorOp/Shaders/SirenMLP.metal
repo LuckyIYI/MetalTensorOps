@@ -6,8 +6,8 @@ using namespace metal;
 using namespace mpp;
 
 #define INPUT_DIM 2
-#define HIDDEN_DIM 64
-#define OUTPUT_DIM 3
+#define HIDDEN_DIM 32
+#define OUTPUT_DIM 1
 
 struct MLPLayers {
     tensor<device half, dextents<int, 2>> W[16];
@@ -18,6 +18,7 @@ kernel void sirenMLP(
     texture2d<float, access::write> outTexture [[texture(0)]],
     constant MLPLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],
+    constant float &time [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const half2 xy = (half2(gid) + 0.5h) / half2(outTexture.get_width(), outTexture.get_height()) * 2.0h - 1.0h;
@@ -70,14 +71,20 @@ kernel void sirenMLP(
     }
 
     float3 col;
-    if constexpr (OUTPUT_DIM == 1) {
+    if  (OUTPUT_DIM == 1) {
         const half sdf = input[0, 0];
-        col = sin(sdf * 100.0h) * 0.5 + 0.5;
-    } else if constexpr (OUTPUT_DIM == 3) {
+        float t = time;
+        float2 uv = float2(gid) / float2(outTexture.get_width(), outTexture.get_height());
+        float phase = sin(dot(float2(1.0), float2(-uv.y, uv.x)) * 300.0 * mix(sdf, 0.6h, 0.95h) + t * 3.0);
+        float r = 0.5 + 0.5 * sin(2.0 * M_PI_F * (length(uv) + phase * 0.31));
+        float g = 0.5 + 0.5 * sin(2.0 * M_PI_F * (length(uv) + phase * 0.3));
+        float b = 0.5 + 0.5 * sin(2.0 * M_PI_F * (length(uv) + phase * 0.32));
+        col = mix(float3(1.0, 0.445, 0.186), float3(r, g, b), smoothstep(0.0h, 0.01h, sdf));
+    } else if  (OUTPUT_DIM == 3) {
         float r = float(input[0, 0]);
         float g = float(input[1, 0]);
         float b = float(input[2, 0]);
-        col = float3(r, g, b) ;
+        col = float3(r, g, b);
     }
 
     outTexture.write(float4(col, 1.0), gid);

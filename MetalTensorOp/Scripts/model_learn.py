@@ -1,10 +1,6 @@
-#!/usr/bin/env python3
-# siren_learn.py — Unified SVG SDF and Image SIREN trainer (c) 2025 MIT-licensed
-# -----------------------------------------------------------------------------
 import argparse, math, numpy as np, matplotlib.pyplot as plt, torch, torch.nn as nn
 from pathlib import Path
 
-# Optional imports for features depending on input type
 try:
     from svgpathtools import svg2paths2
 except ImportError:
@@ -188,12 +184,13 @@ def train_and_show(coords, targets, out_dim, shape_or_res, steps, lr, weights_pa
     if out_dim == 1:
         Y = Y.unsqueeze(1)
     if model_type == 'fourier':
-        net = FourierMLP(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim, num_frequencies=128, sigma=10.0).to(device)
+        net = FourierMLP(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim, num_frequencies=64, sigma=1.0).to(device)
     else:
         net = SIREN(hidden_dim=hidden_dim, num_layers=num_layers, out_dim=out_dim).to(device)
     optim = torch.optim.Adam(net.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=steps)
     mse = nn.MSELoss()
+
     for it in range(1, steps+1):
         loss = mse(net(X), Y)
         optim.zero_grad()
@@ -230,11 +227,11 @@ def main():
     group.add_argument("--svg", help="SVG file to learn (SDF mode)")
     group.add_argument("--image", help="Image file to learn (image mode)")
     ap.add_argument("--fourier", action='store_true', help="Use Fourier feature MLP instead of SIREN")
-    ap.add_argument("--res", type=int, default=64, help="grid resolution for SDF mode (default: 64)")
-    ap.add_argument("--max_dim", type=int, default=64, help="image max dim for image mode (default: 64)")
+    ap.add_argument("--res", type=int, default=256, help="grid resolution for SDF mode (default: 64)")
+    ap.add_argument("--max_dim", type=int, default=256, help="image max dim for image mode (default: 64)")
     ap.add_argument("--weights", default="model.json", help="where to write trained model (default: model.json)")
-    ap.add_argument("--steps", type=int, default=2000, help="number of training steps (default: 2000)")
-    ap.add_argument("--hidden_dim", type=int, default=64, help="width of hidden layers (default: 128)")
+    ap.add_argument("--steps", type=int, default=10000, help="number of training steps (default: 2000)")
+    ap.add_argument("--hidden_dim", type=int, default=32, help="width of hidden layers (default: 128)")
     ap.add_argument("--num_layers", type=int, default=8, help="number of SIREN hidden layers (default: 3)")
     ap.add_argument("--lr", type=float, default=1e-3, help="learning rate (default: 1e-3)")
     args = ap.parse_args()
@@ -275,4 +272,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

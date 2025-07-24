@@ -1,13 +1,12 @@
 import Metal
 import Foundation
+import QuartzCore
 
 enum SirenEncoderError: Error {
     case failedToLocateModelJson(String)
     case noMLPFoundInModelFile
-    case failedToCreateTensorArgumentsBuffer
-    case failedToCreateLayerCountBuffer
+    case failedToCreateBuffer
 }
-
 
 struct MLPTensorArguments {
     var weight: StaticArray16<MTLResourceID>
@@ -23,8 +22,8 @@ final class SirenEncoder: ComputeEncoder {
     let pipelineState: MTLComputePipelineState
     var argumentTable: any MTL4ArgumentTable
     let residencySet: MTLResidencySet
-    let mlp: MLP
-
+    private let mlp: MLP
+    private var timeBuffer: MTLBuffer
 
     init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
@@ -40,7 +39,7 @@ final class SirenEncoder: ComputeEncoder {
         
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
-        tableDesc.maxBufferBindCount = 2
+        tableDesc.maxBufferBindCount = 3
         
         let fileName = "siren"
         
@@ -58,7 +57,7 @@ final class SirenEncoder: ComputeEncoder {
         self.argumentTable = try device.makeArgumentTable(descriptor: tableDesc)
 
         let desc = MTL4ArgumentTableDescriptor()
-        desc.maxBufferBindCount = 2
+        desc.maxBufferBindCount = 3
         desc.maxTextureBindCount = 1
 
         var mlpTensorArguments = MLPTensorArguments()
@@ -71,18 +70,24 @@ final class SirenEncoder: ComputeEncoder {
         }
 
         guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<MLPTensorArguments>.stride, options: .storageModeShared) else {
-            throw SirenEncoderError.failedToCreateTensorArgumentsBuffer
+            throw SirenEncoderError.failedToCreateBuffer
         }
         memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<MLPTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
         guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size) else {
-            throw SirenEncoderError.failedToCreateLayerCountBuffer
+            throw SirenEncoderError.failedToCreateBuffer
         }
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
 
+        guard let timeBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared) else {
+            throw SirenEncoderError.failedToCreateBuffer
+        }
+        self.timeBuffer = timeBuffer
+
         self.argumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
         self.argumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
+        self.argumentTable.setAddress(timeBuffer.gpuAddress, index: 2)
 
         let residency = try device.makeResidencySet(descriptor: .init())
         queue.addResidencySet(residency)
@@ -98,6 +103,9 @@ final class SirenEncoder: ComputeEncoder {
     }
 
     func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer) {
+        var t = Float(CACurrentMediaTime())
+        memcpy(timeBuffer.contents(), &t, MemoryLayout<Float>.size)
+
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
         commandBuffer.useResidencySet(residencySet)
@@ -114,4 +122,3 @@ final class SirenEncoder: ComputeEncoder {
         encoder.endEncoding()
     }
 }
-

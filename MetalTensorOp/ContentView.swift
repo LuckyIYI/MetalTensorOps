@@ -210,7 +210,7 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
         if let width = imageWidth, let height = imageHeight {
             mtkView.drawableSize = CGSize(width: width, height: height)
         } else {
-            mtkView.drawableSize = CGSize(width: 512, height: 512)
+            mtkView.drawableSize = CGSize(width: 300, height: 300)
         }
 
         drawingEnabled = true
@@ -263,8 +263,8 @@ struct ContentView: View {
 
     var body: some View {
         let coordinator = Coordinator(modelKind: modelKind)
-        let width = coordinator.imageWidth.map { CGFloat($0) } ?? 512
-        let height = coordinator.imageHeight.map { CGFloat($0) } ?? 512
+        let width = coordinator.imageWidth.map { CGFloat($0) } ?? 300
+        let height = coordinator.imageHeight.map { CGFloat($0) } ?? 300
 
         MetalCircleView(coordinator: coordinator)
             .frame(width: width, height: height)
@@ -275,5 +275,5 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-        .environment(\.modelKind, .siren) // or .fourier for preview purposes
+        .environment(\.modelKind, .siren)
 }

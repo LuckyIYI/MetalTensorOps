@@ -6,9 +6,9 @@ using namespace metal;
 using namespace mpp;
 
 #define INPUT_DIM 2
-#define NUM_FREQ 128
-#define HIDDEN_DIM 64
-#define OUTPUT_DIM 3
+#define NUM_FREQ 64
+#define HIDDEN_DIM 32
+#define OUTPUT_DIM 1
 
 struct FourierLayers {
     tensor<device half, dextents<int, 2>> W[16];
@@ -21,6 +21,7 @@ kernel void fourierMLP(
     constant FourierLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],
     constant float &sigma [[buffer(2)]],
+    constant float &time [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const int fourierDim = NUM_FREQ * 2;
@@ -84,14 +85,21 @@ kernel void fourierMLP(
     }
 
     float3 col;
-    if constexpr (OUTPUT_DIM == 1) {
+    if  (OUTPUT_DIM == 1) {
         const half sdf = current_activation[0];
-        col = sin(float(sdf) * 1.0f) * 0.5f + 0.5f;
-    } else if constexpr (OUTPUT_DIM == 3) {
+        float t = time;
+        float2 uv = float2(gid) / float2(outTexture.get_width(), outTexture.get_height());
+        float phase = sin(dot(float2(1.0), float2(-uv.y, uv.x)) * 300.0 * mix(sdf, 0.6h, 0.95h) + t * 3.0);
+        float r = 0.5 + 0.5 * sin(2.0 * M_PI_F * (length(uv) + phase * 0.31));
+        float g = 0.5 + 0.5 * sin(2.0 * M_PI_F * (length(uv) + phase * 0.3));
+        float b = 0.5 + 0.5 * sin(2.0 * M_PI_F * (length(uv) + phase * 0.32));
+        col = mix(float3(1.0, 0.445, 0.186), float3(r, g, b), smoothstep(0.0h, 0.01h, sdf));
+    } else if  (OUTPUT_DIM == 3) {
         float r = float(current_activation[0]);
         float g = float(current_activation[1]);
         float b = float(current_activation[2]);
         col = float3(r, g, b);
     }
+
     outTexture.write(float4(col, 1.0), gid);
 }

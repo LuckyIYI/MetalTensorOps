@@ -1,15 +1,13 @@
 import Metal
 import Foundation
+import QuartzCore
 
 enum FourierEncoderError: Error {
     case failedToLocateModelJson
     case noMLPFoundInModelFile
     case fourierParamsMissing
-    case failedToCreateTensorArgumentsBuffer
-    case failedToCreateLayerCountBuffer
-    case failedToCreateSigmaBuffer
+    case failedToCreateBuffer
 }
-
 
 struct FourierTensorArguments {
     var weight: StaticArray16<MTLResourceID>
@@ -27,8 +25,9 @@ final class FourierEncoder: ComputeEncoder {
     let pipelineState: MTLComputePipelineState
     var argumentTable: any MTL4ArgumentTable
     let residencySet: MTLResidencySet
-    let mlp: MLP
-    let fourier: FourierParams
+    private let mlp: MLP
+    private let fourier: FourierParams
+    private var timeBuffer: MTLBuffer
 
     init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
@@ -40,7 +39,7 @@ final class FourierEncoder: ComputeEncoder {
         self.pipelineState.reflection?.bindings.forEach { print($0) }
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
-        tableDesc.maxBufferBindCount = 4
+        tableDesc.maxBufferBindCount = 5
 
         guard let url = Bundle.main.url(forResource: "fourier", withExtension: "json") else {
             throw FourierEncoderError.failedToLocateModelJson
@@ -69,18 +68,23 @@ final class FourierEncoder: ComputeEncoder {
         mlpTensorArguments.bMatrix = fourier.bTensor.gpuResourceID
 
         guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<FourierTensorArguments>.stride, options: .storageModeShared) else {
-            throw FourierEncoderError.failedToCreateTensorArgumentsBuffer
+            throw FourierEncoderError.failedToCreateBuffer
         }
         memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<FourierTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
         guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size) else {
-            throw FourierEncoderError.failedToCreateLayerCountBuffer
+            throw FourierEncoderError.failedToCreateBuffer
         }
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
-
+ 
+        guard let timeBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared) else {
+            throw FourierEncoderError.failedToCreateBuffer
+        }
+        self.timeBuffer = timeBuffer
+        
         guard let sigmaBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
-            throw FourierEncoderError.failedToCreateSigmaBuffer
+            throw FourierEncoderError.failedToCreateBuffer
         }
         var sigmaCopy = sigma
         memcpy(sigmaBuffer.contents(), &sigmaCopy, MemoryLayout<Float>.stride)
@@ -88,6 +92,7 @@ final class FourierEncoder: ComputeEncoder {
         self.argumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
         self.argumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
         self.argumentTable.setAddress(sigmaBuffer.gpuAddress, index: 2)
+        self.argumentTable.setAddress(timeBuffer.gpuAddress, index: 3)
 
         let residency = try device.makeResidencySet(descriptor: .init())
         queue.addResidencySet(residency)
@@ -103,6 +108,9 @@ final class FourierEncoder: ComputeEncoder {
     }
 
     func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer) {
+        var t = Float(CACurrentMediaTime())
+        memcpy(timeBuffer.contents(), &t, MemoryLayout<Float>.size)
+
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         commandBuffer.useResidencySet(residencySet)
         encoder.setComputePipelineState(pipelineState)
