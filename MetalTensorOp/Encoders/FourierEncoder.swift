@@ -10,8 +10,8 @@ enum FourierEncoderError: Error {
 }
 
 struct FourierTensorArguments {
-    var weight: StaticArray16<MTLResourceID>
-    var bias: StaticArray16<MTLResourceID>
+    var weight: InlineArray<16, MTLResourceID>
+    var bias: InlineArray<16, MTLResourceID>
     var bMatrix: MTLResourceID
 
     init() {

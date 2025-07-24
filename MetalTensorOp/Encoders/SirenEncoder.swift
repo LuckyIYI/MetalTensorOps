@@ -9,8 +9,8 @@ enum SirenEncoderError: Error {
 }
 
 struct MLPTensorArguments {
-    var weight: StaticArray16<MTLResourceID>
-    var bias: StaticArray16<MTLResourceID>
+    var weight: InlineArray<16, MTLResourceID>
+    var bias: InlineArray<16, MTLResourceID>
     
     init() {
         weight = .init(repeating: .init())
