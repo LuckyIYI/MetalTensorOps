@@ -77,8 +77,9 @@ struct MetalCircleView: UIViewRepresentable {
         mtkView.device = device
         mtkView.framebufferOnly = false
         mtkView.delegate = context.coordinator
-        mtkView.clearColor = .init(red: 1, green: 1, blue: 1, alpha: 1)
-
+        mtkView.clearColor = .init(red: 0, green: 0, blue: 0, alpha: 1)
+        mtkView.backgroundColor = .black
+    
         context.coordinator.setup(device: device, mtkView: mtkView)
 
         if let width = context.coordinator.imageWidth, let height = context.coordinator.imageHeight {
@@ -265,11 +266,13 @@ struct ContentView: View {
         let coordinator = Coordinator(modelKind: modelKind)
         let width = coordinator.imageWidth.map { CGFloat($0) } ?? 300
         let height = coordinator.imageHeight.map { CGFloat($0) } ?? 300
-
-        MetalCircleView(coordinator: coordinator)
-            .frame(width: width, height: height)
-            .padding()
-            .id(modelKind)
+        
+        ZStack {
+            Color.black.ignoresSafeArea()
+            MetalCircleView(coordinator: coordinator)
+                .frame(width: width, height: height)
+                .id(modelKind)
+        }
     }
 }
 

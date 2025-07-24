@@ -10,8 +10,8 @@ using namespace mpp;
 #define OUTPUT_DIM 1
 
 struct MLPLayers {
-    tensor<device half, dextents<int, 2>> W[16];
-    tensor<device half, dextents<int, 1>> B[16];
+    tensor<device half, dextents<int, 2>> weights[16];
+    tensor<constant half, dextents<int, 1>> biases[16];
 };
 
 kernel void sirenMLP(
@@ -40,26 +40,25 @@ kernel void sirenMLP(
     constexpr tensor_ops::matmul2d_descriptor outputDesc(1, OUTPUT_DIM, HIDDEN_DIM, false, false, true);
 
     for (uint layerIndex = 0; layerIndex < mlpLayerCount; ++layerIndex) {
-        auto W = mlpLayers.W[layerIndex];
-        auto B = mlpLayers.B[layerIndex];
+        auto weights = mlpLayers.weights[layerIndex];
+        auto biases = mlpLayers.biases[layerIndex];
 
         bool isLastLayer = (layerIndex == mlpLayerCount - 1);
 
         if (layerIndex == 0) {
             // First layer: input -> hidden
-            tensor_ops::matmul2d<inputDesc, execution_thread>{}.run(input, W, hidden);
-        } else
-            if (isLastLayer) {
+            tensor_ops::matmul2d<inputDesc, execution_thread>{}.run(input, weights, hidden);
+        } else if (isLastLayer) {
             // Last layer: hidden -> output
-            tensor_ops::matmul2d<outputDesc, execution_thread>{}.run(input, W, output);
+            tensor_ops::matmul2d<outputDesc, execution_thread>{}.run(input, weights, output);
         } else {
             // Hidden layers: hidden -> hidden
-            tensor_ops::matmul2d<hiddenDesc, execution_thread>{}.run(input, W, hidden);
+            tensor_ops::matmul2d<hiddenDesc, execution_thread>{}.run(input, weights, hidden);
         }
 
         const uint outputDim = isLastLayer ? OUTPUT_DIM : HIDDEN_DIM;
         for (uint i = 0; i < outputDim; ++i) {
-            half val = (isLastLayer ? output[i, 0] : hidden[i, 0]) + B[i];
+            half val = (isLastLayer ? output[i, 0] : hidden[i, 0]) + biases[i];
             if (isLastLayer) {
                 input[i, 0] = val;
             } else if (layerIndex == 0) {

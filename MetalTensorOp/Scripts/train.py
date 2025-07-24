@@ -135,7 +135,6 @@ def export_weights(net, path, metadata=None):
             "weights": W.tolist(),
             "biases": lin.bias.detach().cpu().numpy().tolist()
         })
-    # Compose output dictionary with new top-level format
     out = {
         "mlp": {
             "layers": layers,

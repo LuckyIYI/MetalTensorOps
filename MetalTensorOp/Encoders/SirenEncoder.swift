@@ -61,7 +61,6 @@ final class SirenEncoder: ComputeEncoder {
         desc.maxTextureBindCount = 1
 
         var mlpTensorArguments = MLPTensorArguments()
-
         for i in 0..<mlp.layers.count {
             mlpTensorArguments.weight[i] = mlp.layers[i].weightTensor.gpuResourceID
         }
