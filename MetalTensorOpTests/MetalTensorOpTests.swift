@@ -81,12 +81,11 @@ func makeTensor(from buffer: MTLBuffer, rows: Int, columns: Int) throws -> MTLTe
 }
 
 struct MetalTensorOpTests {
-    @Test func example() async throws {
+    @Test func testCooperativeMatmul() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw TestError("Metal is not supported on this device")
         }
 
-        // This API is only supported on Apple7 and later
         guard device.supportsFamily(.metal4) else {
             throw TestError("This device does not support the tensor operations used in the shader.")
         }
