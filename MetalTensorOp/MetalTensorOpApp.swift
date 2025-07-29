@@ -10,7 +10,7 @@ struct MetalTensorOpApp: App {
     
     var body: some Scene {
         WindowGroup {
-            ContentView().environment(\.modelKind, .fourier)
+            ContentView().environment(\.modelKind, .siren)
         }
     }
 }
