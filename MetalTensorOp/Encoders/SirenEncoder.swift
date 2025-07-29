@@ -24,6 +24,7 @@ final class SirenEncoder: ComputeEncoder {
     let residencySet: MTLResidencySet
     private let mlp: MLP
     private var timeBuffer: MTLBuffer
+    private let tensorArgumentsBuffer: MTLBuffer
 
     init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
@@ -71,6 +72,7 @@ final class SirenEncoder: ComputeEncoder {
         guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<MLPTensorArguments>.stride, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer
         }
+        self.tensorArgumentsBuffer = tensorArgumentsBuffer
         memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<MLPTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
@@ -94,8 +96,10 @@ final class SirenEncoder: ComputeEncoder {
         for layer in mlp.layers {
             residency.addAllocation(layer.weightTensor)
             residency.addAllocation(layer.biasTensor)
-            residency.addAllocation(layerCountBuffer)
         }
+
+        residency.addAllocation(layerCountBuffer)
+        residency.addAllocation(tensorArgumentsBuffer)
 
         residency.commit()
         self.residencySet = residency
