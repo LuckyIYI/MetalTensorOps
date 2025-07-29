@@ -55,11 +55,21 @@ class MatMulEncoder {
         encoder.setComputePipelineState(pipelineState)
         encoder.setArgumentTable(argumentTable)
 
-        let threadgroups = MTLSize(width: (N + 31) / 32, height: (M + 63) / 64, depth: 1)
-        let simdgroupWidth = pipelineState.threadExecutionWidth
-        let threadsPerThreadgroup = MTLSize(width: simdgroupWidth * 4, height: 1, depth: 1)
+        // Each compute tile covers 32 columns × 64 rows of the output matrix.
+        let tileWidth  = 32
+        let tileHeight = 64
 
-        encoder.dispatchThreadgroups(threadgroupsPerGrid: threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+        // Number of tiles required to cover the full output.
+        let tilesPerGrid = MTLSize(
+            width:  (N + tileWidth  - 1) / tileWidth,
+            height: (M + tileHeight - 1) / tileHeight,
+            depth:  1
+        )
+
+        let simdgroupWidth = pipelineState.threadExecutionWidth
+        let threadsPerGroup = MTLSize(width: simdgroupWidth * 4, height: 1, depth:  1)
+
+        encoder.dispatchThreadgroups(threadgroupsPerGrid: tilesPerGrid, threadsPerThreadgroup: threadsPerGroup)
         encoder.endEncoding()
     }
 }
@@ -198,7 +208,7 @@ struct Metal4Tests {
 class MatMulMetal3Encoder {
     let pipelineState: MTLComputePipelineState
     let device: MTLDevice
-    let functionName = "simdgroupMatmulLegacy"
+    let functionName = "simdgroupMatmulMetal3"
     let bufferA: MTLBuffer
     let bufferB: MTLBuffer
     let bufferC: MTLBuffer

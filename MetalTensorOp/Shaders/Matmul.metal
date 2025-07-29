@@ -38,10 +38,10 @@ kernel void simdgroupMatmulMetal3(
 
     sg_mat acc = make_filled_simdgroup_matrix<float, TILE_M, TILE_N>(float(0));
 
-    for (uint k = 0; k < K; k += TILE_K) {
-        simdgroup_half8x8 aFrag;
-        simdgroup_half8x8 bFrag;
+    simdgroup_half8x8 aFrag;
+    simdgroup_half8x8 bFrag;
 
+    for (uint k = 0; k < K; k += TILE_K) {
         // Load   A[rowBase .. rowBase+7][k .. k+7]
         simdgroup_load(aFrag, A + rowBase * K + k, K);
         // Load   B[k .. k+7][colBase .. colBase+7]
