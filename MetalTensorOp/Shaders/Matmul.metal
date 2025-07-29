@@ -5,7 +5,7 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-kernel void matmul_auto_slice_dynamic_extents(
+kernel void simdgroupMatmul(
     tensor<device half, dextents<int, 2>> A [[buffer(0)]],
     tensor<device half, dextents<int, 2>> B [[buffer(1)]],
     tensor<device half, dextents<int, 2>> C [[buffer(2)]],

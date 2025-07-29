@@ -23,7 +23,7 @@ class MatMulEncoder {
     ) throws {
         self.device = device
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
-        functionDescriptor.name = "matmul_auto_slice_dynamic_extents"
+        functionDescriptor.name = "simdgroupMatmul"
         functionDescriptor.library = library
 
         let pipelineDescriptor = MTL4ComputePipelineDescriptor()
