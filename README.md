@@ -11,16 +11,16 @@ This repo is a playground where I am planning to implement a few examples. The f
 > *WARNING: the tensor API is still unstable. It fails on M1 Macs, works on iPhone (with plenty of error logs), and crashes on visionOS.*
 
 
-## Findings
+## Findings && Tips
 
-* Thread‑level matmul doesn’t run on M1 (black screen); likely GPU‑family limitation or beta bug.
+* Thread‑level matmul doesn’t run on M1 (black screen); Likely a beta bug or something is wrong with my implementation.
 * The same shader fails to compile on visionOS.
-* Matmul behaviour is sensitive to tensor shape *and* operation order.
 * Headers show matmul lacks `int4` support.
+* Make sure you use dynamic_length_v<int> instead of 0 for K, when you create matmul2d_descriptor.
 * The Metal‑Shading‑Language specification is the main source of truth.
-* `MPPTensorOpsMatMul2d.h` explains cooperative tensors well, though its sample code chunks are already outdated.
+* `MPPTensorOpsMatMul2d.h` explains cooperative tensors well and has a lot of useful info, but its sample code chunks are already outdated.
 * Argument tables let you bind resources by ID or attach argument buffers containing multiple GPU resources.
-
+* Ensure you add **all** allocations to residency set.  
 
 
 ## TODO List
