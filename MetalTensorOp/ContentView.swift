@@ -42,6 +42,7 @@ struct MetalCircleView: NSViewRepresentable {
         }
         mtkView.device = device
         mtkView.framebufferOnly = false
+        (mtkView.layer as? CAMetalLayer)?.framebufferOnly = false
         mtkView.delegate = context.coordinator
         mtkView.clearColor = .init(red: 1, green: 1, blue: 1, alpha: 1)
 
@@ -76,6 +77,7 @@ struct MetalCircleView: UIViewRepresentable {
         }
         mtkView.device = device
         mtkView.framebufferOnly = false
+        (mtkView.layer as? CAMetalLayer)?.framebufferOnly = false
         mtkView.delegate = context.coordinator
         mtkView.clearColor = .init(red: 0, green: 0, blue: 0, alpha: 1)
         mtkView.backgroundColor = .black
@@ -99,7 +101,12 @@ struct MetalCircleView: UIViewRepresentable {
 class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     var device: MTLDevice?
     var commandQueue: MTL4CommandQueue?
-    var commandAllocator: MTL4CommandAllocator?
+    var commandAllocators: [MTL4CommandAllocator] = []
+    
+    var sharedEvent: MTLSharedEvent?
+    var frameNumber: UInt64 = 0
+    let maxFramesInFlight = 3
+    
     var encoder: ComputeEncoder?
     var commandBuffer: MTL4CommandBuffer?
     var compiler: MTL4Compiler?
@@ -138,12 +145,18 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
         }
         self.commandQueue = commandQueue
 
-        guard let commandAllocator = device.makeCommandAllocator() else {
-            print("[Coordinator] Failed to create MTL4CommandAllocator")
-            drawingEnabled = false
-            return
+        commandAllocators = []
+        for _ in 0..<maxFramesInFlight {
+            guard let allocator = device.makeCommandAllocator() else {
+                print("[Coordinator] Failed to create MTL4CommandAllocator")
+                drawingEnabled = false
+                return
+            }
+            commandAllocators.append(allocator)
         }
-        self.commandAllocator = commandAllocator
+
+        sharedEvent = device.makeSharedEvent()
+        sharedEvent?.signaledValue = 0
 
         do {
             compiler = try device.makeCompiler(descriptor: .init())
@@ -223,15 +236,21 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
         guard drawingEnabled else {
             return
         }
+        
+        if frameNumber >= maxFramesInFlight {
+            let previousValueToWaitFor = frameNumber - UInt64(maxFramesInFlight)
+            sharedEvent?.wait(untilSignaledValue: previousValueToWaitFor, timeoutMS: 10)
+        }
 
         guard let drawable = view.currentDrawable else {
             print("[Coordinator] No current drawable available")
             return
         }
-        guard let commandAllocator = commandAllocator else {
-            print("[Coordinator] Command allocator is nil")
-            return
-        }
+        
+        let frameIndex = Int(frameNumber % UInt64(maxFramesInFlight))
+        let commandAllocator = commandAllocators[frameIndex]
+        commandAllocator.reset()
+
         guard let commandBuffer = device?.makeCommandBuffer() else {
             print("[Coordinator] Failed to create MTL4CommandBuffer in draw")
             return
@@ -245,7 +264,6 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
             return
         }
 
-        commandAllocator.reset()
         commandBuffer.beginCommandBuffer(allocator: commandAllocator)
 
         encoder.encode(drawableTexture: drawable.texture, commandBuffer: commandBuffer)
@@ -255,6 +273,11 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
         commandQueue.commit([commandBuffer])
         commandQueue.signalDrawable(drawable)
         drawable.present()
+        
+        let valueToSignal = frameNumber
+        commandQueue.signalEvent(sharedEvent!, value: valueToSignal)
+        
+        frameNumber += 1
     }
 }
 

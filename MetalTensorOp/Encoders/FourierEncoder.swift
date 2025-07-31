@@ -101,11 +101,24 @@ final class FourierEncoder: ComputeEncoder {
         for layer in mlp.layers {
             residency.addAllocation(layer.weightTensor)
             residency.addAllocation(layer.biasTensor)
+            
+            if let weightBuffer = layer.weightTensor as? MTLBuffer {
+                residency.addAllocation(weightBuffer)
+            }
+            
+            if let biasBuffer = layer.biasTensor as? MTLBuffer {
+                residency.addAllocation(biasBuffer)
+            }
         }
+
         residency.addAllocation(layerCountBuffer)
         residency.addAllocation(fourier.bTensor)
+        if let bBuffer = fourier.bTensor as? MTLBuffer {
+            residency.addAllocation(bBuffer)
+        }
         residency.addAllocation(tensorArgumentsBuffer)
-        
+        residency.addAllocation(timeBuffer)
+
         residency.commit()
         self.residencySet = residency
     }
