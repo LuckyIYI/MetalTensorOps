@@ -9,11 +9,11 @@ struct TestError: Error, CustomStringConvertible {
 
 func makeTensor(from buffer: MTLBuffer, rows: Int, columns: Int) throws -> MTLTensor {
     guard let extents = MTLTensorExtents([columns, rows]) else {
-        throw TestError("Failed to create extents")
+        throw TestError("Failed to create extents for a \(rows)x\(columns) tensor")
     }
 
     guard let strides = MTLTensorExtents([1, columns]) else {
-        throw TestError("Failed to create strides")
+        throw TestError("Failed to create strides for a \(rows)x\(columns) tensor")
     }
     let descriptor = MTLTensorDescriptor()
     descriptor.dimensions = extents
@@ -23,11 +23,18 @@ func makeTensor(from buffer: MTLBuffer, rows: Int, columns: Int) throws -> MTLTe
     return try buffer.makeTensor(descriptor: descriptor, offset: 0)
 }
 
-struct Metal4Tests {
-    @Test func testSimdgroupMatrixMatrix() async throws {
+struct TestContext {
+    let device: MTLDevice
+    let commandQueue: MTL4CommandQueue
+    let commandAllocator: MTL4CommandAllocator
+    let compiler: MTL4Compiler
+    let library: MTLLibrary
+
+    init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw TestError("Metal is not supported on this device")
         }
+        self.device = device
 
         guard device.supportsFamily(.metal4) else {
             throw TestError("This device does not support the tensor operations used in the shader.")
@@ -36,384 +43,272 @@ struct Metal4Tests {
         guard let commandQueue = device.makeMTL4CommandQueue() else {
             throw TestError("Could not create command queue")
         }
+        self.commandQueue = commandQueue
 
         guard let commandAllocator = device.makeCommandAllocator() else {
             throw TestError("Could not create command allocator")
         }
+        self.commandAllocator = commandAllocator
 
-        let compiler = try device.makeCompiler(descriptor: .init())
-        let library = try device.makeDefaultLibrary(bundle: .main)
+        self.compiler = try device.makeCompiler(descriptor: .init())
+        self.library = try device.makeDefaultLibrary(bundle: .main)
+    }
+}
 
-        let M = 128
-        let N = 64
-        let K = 256
+func setupMatrixMatrixTest(device: MTLDevice, M: Int, N: Int, K: Int) throws -> (bufferA: MTLBuffer, bufferB: MTLBuffer, bufferC: MTLBuffer, matrixA: [Float16], matrixB: [Float16]) {
+    let sizeA = M * K * MemoryLayout<Float16>.size
+    let sizeB = K * N * MemoryLayout<Float16>.size
+    let sizeC = M * N * MemoryLayout<Float16>.size
 
-        let sizeA = M * K * MemoryLayout<Float16>.size
-        let sizeB = K * N * MemoryLayout<Float16>.size
-        let sizeC = M * N * MemoryLayout<Float16>.size
-
-        guard let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared) else { throw TestError("Could not create buffer A")}
-        guard let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared) else { throw TestError("Could not create buffer B")}
-        guard let bufferC = device.makeBuffer(length: sizeC, options: .storageModeShared) else { throw TestError("Could not create buffer C") }
-
-        var matrixA = [Float16](repeating: 0, count: M * K)
-        var matrixB = [Float16](repeating: 0, count: K * N)
-        for i in 0..<(M * K) {
-            matrixA[i] = Float16.random(in: 0...1)
-        }
-        for i in 0..<(K * N) {
-            matrixB[i] = Float16.random(in: 0...1)
-        }
-
-        bufferA.contents().copyMemory(from: matrixA, byteCount: sizeA)
-        bufferB.contents().copyMemory(from: matrixB, byteCount: sizeB)
-        bufferC.contents().initializeMemory(as: UInt8.self, repeating: 0, count: sizeC)
-
-        let rowsA = M; let colsA = K
-        let rowsB = K; let colsB = N
-        let rowsC = M; let colsC = N
-
-
-        let tensorA = try makeTensor(from: bufferA, rows: rowsA, columns: colsA)
-        let tensorB = try makeTensor(from: bufferB, rows: rowsB, columns: colsB)
-        let tensorC = try makeTensor(from: bufferC, rows: rowsC, columns: colsC)
-
-        guard let commandBuffer = device.makeCommandBuffer() else {
-            throw TestError("Could not create command buffer")
-        }
-
-        let encoder = try SimdMatrixMatrixEncoder(
-            device: device,
-            library: library,
-            compiler: compiler,
-            queue: commandQueue,
-            tensorA: tensorA,
-            tensorB: tensorB,
-            tensorC: tensorC
-        )
-
-        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
-
-        let start = ContinuousClock.now
-
-        encoder.encode(commandBuffer: commandBuffer, M: M, N: N)
-        commandBuffer.endCommandBuffer()
-
-        let commitOptionsCol = MTL4CommitOptions()
-
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            commitOptionsCol.addFeedbackHandler { feedback in
-                if feedback.error == nil {
-                    cont.resume()
-                } else {
-                    cont.resume(throwing: TestError("GPU execution failed with error: \(feedback.error!)"))
-                }
-            }
-            commandQueue.commit([commandBuffer], options: commitOptionsCol)
-        }
-
-        let elapsed = start.duration(to: ContinuousClock.now)
-        print("GPU time (SimdgroupMatmul): \(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) ms")
-
-        var resultMatrix = [Float16](repeating: 0, count: M * N)
-        let resultBufferPointer = bufferC.contents().bindMemory(to: Float16.self, capacity: M * N)
-        resultMatrix = Array(UnsafeBufferPointer(start: resultBufferPointer, count: M * N))
-
-//        print("Result matrix (first 10 elements): \(resultMatrix.prefix(10))")
-
-        let epsilon: Float = 1e-1
-        let testIndices = [(0,0), (0,1), (1,0), (M-1, N-1), (M/2, N/2)]
-        for (row, col) in testIndices {
-            var expected: Float = 0
-            for k in 0..<K {
-                let a = Float(matrixA[row * K + k])
-                let b = Float(matrixB[k * N + col])
-                expected += a * b
-            }
-            let gpuValue = Float(resultMatrix[row * N + col])
-            print("C[\(row),\(col)]: expected = \(expected), real = \(gpuValue)")
-            #expect(abs(gpuValue - expected) < epsilon, "C[\(row),\(col)] mismatch: CPU = \(expected), GPU = \(gpuValue)")
-        }
+    guard let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared),
+          let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared),
+          let bufferC = device.makeBuffer(length: sizeC, options: .storageModeShared) else {
+        throw TestError("Could not create buffers for Matrix-Matrix test")
     }
 
-    @Test func testThreadMatrixMatrix() async throws {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw TestError("Metal is not supported on this device")
-        }
-        guard device.supportsFamily(.metal4) else {
-            throw TestError("This device does not support the tensor operations used in the shader.")
-        }
-        guard let commandQueue = device.makeMTL4CommandQueue() else {
-            throw TestError("Could not create command queue")
-        }
-        guard let commandAllocator = device.makeCommandAllocator() else {
-            throw TestError("Could not create command allocator")
-        }
+    let matrixA = [Float16](unsafeUninitializedCapacity: M * K) { buffer, initializedCount in
+        for i in 0..<(M * K) { buffer[i] = Float16.random(in: 0...1) }
+        initializedCount = M * K
+    }
+    let matrixB = [Float16](unsafeUninitializedCapacity: K * N) { buffer, initializedCount in
+        for i in 0..<(K * N) { buffer[i] = Float16.random(in: 0...1) }
+        initializedCount = K * N
+    }
 
-        let compiler = try device.makeCompiler(descriptor: .init())
-        let library = try device.makeDefaultLibrary(bundle: .main)
-        let M = 64
-        let N = 32
-        let K = 32
-        let sizeA = M * K * MemoryLayout<Float16>.size
-        let sizeB = K * N * MemoryLayout<Float16>.size
-        let sizeC = M * N * MemoryLayout<Float16>.size
+    bufferA.contents().copyMemory(from: matrixA, byteCount: sizeA)
+    bufferB.contents().copyMemory(from: matrixB, byteCount: sizeB)
+    bufferC.contents().initializeMemory(as: UInt8.self, repeating: 0, count: sizeC)
 
-        guard let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared) else { throw TestError("Could not create buffer A")}
-        guard let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared) else { throw TestError("Could not create buffer B")}
-        guard let bufferC = device.makeBuffer(length: sizeC, options: .storageModeShared) else { throw TestError("Could not create buffer C")}
+    return (bufferA, bufferB, bufferC, matrixA, matrixB)
+}
 
-        var matrixA = [Float16](repeating: 0, count: M * K)
-        var matrixB = [Float16](repeating: 0, count: K * N)
-        for i in 0..<(M * K) { matrixA[i] = Float16.random(in: 0...1) }
-        for i in 0..<(K * N) { matrixB[i] = Float16.random(in: 0...1) }
+func setupVectorMatrixTest(device: MTLDevice, K: Int, N: Int) throws -> (bufferA: MTLBuffer, bufferB: MTLBuffer, bufferC: MTLBuffer, vectorA: [Float16], matrixB: [Float16]) {
+    let sizeA = 1 * K * MemoryLayout<Float16>.size
+    let sizeB = K * N * MemoryLayout<Float16>.size
+    let sizeC = 1 * N * MemoryLayout<Float16>.size
 
-        bufferA.contents().copyMemory(from: matrixA, byteCount: sizeA)
-        bufferB.contents().copyMemory(from: matrixB, byteCount: sizeB)
-        bufferC.contents().initializeMemory(as: UInt8.self, repeating: 0, count: sizeC)
+    guard let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared),
+          let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared),
+          let bufferC = device.makeBuffer(length: sizeC, options: .storageModeShared) else {
+        throw TestError("Could not create buffers for Vector-Matrix test")
+    }
+
+    var vectorA = [Float16](unsafeUninitializedCapacity: K) { $1 = K }
+    for i in 0..<K { vectorA[i] = Float16.random(in: 0...1) }
+    
+    var matrixB = [Float16](unsafeUninitializedCapacity: K * N) { $1 = K * N }
+    for i in 0..<(K * N) { matrixB[i] = Float16.random(in: 0...1) }
+
+    bufferA.contents().copyMemory(from: vectorA, byteCount: sizeA)
+    bufferB.contents().copyMemory(from: matrixB, byteCount: sizeB)
+    bufferC.contents().initializeMemory(as: UInt8.self, repeating: 0, count: sizeC)
+    
+    return (bufferA, bufferB, bufferC, vectorA, matrixB)
+}
+
+func setupMatrixVectorTest(device: MTLDevice, M: Int, K: Int) throws -> (bufferA: MTLBuffer, bufferB: MTLBuffer, bufferC: MTLBuffer, matrixA: [Float16], vectorB: [Float16]) {
+    let sizeA = M * K * MemoryLayout<Float16>.size
+    let sizeB = K * 1 * MemoryLayout<Float16>.size
+    let sizeC = M * 1 * MemoryLayout<Float16>.size
+
+    guard let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared),
+          let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared),
+          let bufferC = device.makeBuffer(length: sizeC, options: .storageModeShared) else {
+        throw TestError("Could not create buffers for Matrix-Vector test")
+    }
+
+    var matrixA = [Float16](unsafeUninitializedCapacity: M * K) { $1 = M * K }
+    for i in 0..<(M * K) { matrixA[i] = Float16.random(in: 0...1) }
+    
+    var vectorB = [Float16](unsafeUninitializedCapacity: K) { $1 = K }
+    for i in 0..<K { vectorB[i] = Float16.random(in: 0...1) }
+
+    bufferA.contents().copyMemory(from: matrixA, byteCount: sizeA)
+    bufferB.contents().copyMemory(from: vectorB, byteCount: sizeB)
+    bufferC.contents().initializeMemory(as: UInt8.self, repeating: 0, count: sizeC)
+    
+    return (bufferA, bufferB, bufferC, matrixA, vectorB)
+}
+
+func executeAndWait(
+    context: TestContext,
+    testName: String,
+    encodeCommands: (MTL4CommandBuffer) throws -> Void
+) async throws {
+    guard let commandBuffer = context.device.makeCommandBuffer() else {
+        throw TestError("Could not create command buffer")
+    }
+    
+    commandBuffer.beginCommandBuffer(allocator: context.commandAllocator)
+    let start = ContinuousClock.now
+    
+    try encodeCommands(commandBuffer)
+    
+    commandBuffer.endCommandBuffer()
+    
+    let commitOptions = MTL4CommitOptions()
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        commitOptions.addFeedbackHandler { feedback in
+            if let error = feedback.error {
+                cont.resume(throwing: TestError("GPU execution failed for \(testName): \(error)"))
+            } else {
+                cont.resume()
+            }
+        }
+        context.commandQueue.commit([commandBuffer], options: commitOptions)
+    }
+    
+    let elapsed = start.duration(to: ContinuousClock.now)
+    print("GPU time (\(testName)): \(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) ms")
+}
+
+func verifyMatrixMatrixResult(
+    bufferC: MTLBuffer, M: Int, N: Int, K: Int,
+    matrixA: [Float16], matrixB: [Float16],
+    epsilon: Float = 1e-1
+) {
+    let resultPtr = bufferC.contents().bindMemory(to: Float16.self, capacity: M * N)
+    let resultMatrix = Array(UnsafeBufferPointer(start: resultPtr, count: M * N))
+
+    let testIndices = [(0,0), (M-1,N-1), (M/2,N/2)]
+    for (row, col) in testIndices {
+        var expected: Float = 0
+        for k in 0..<K {
+            expected += Float(matrixA[row * K + k]) * Float(matrixB[k * N + col])
+        }
+        let gpuValue = Float(resultMatrix[row * N + col])
+        print("C[\(row),\(col)]: GPU=\(gpuValue), CPU=\(expected)")
+        #expect(abs(gpuValue - expected) < epsilon, "Mismatch at (\(row),\(col))")
+    }
+}
+
+func verifyVectorMatrixResult(
+    bufferC: MTLBuffer, N: Int, K: Int,
+    vectorA: [Float16], matrixB: [Float16],
+    epsilon: Float = 1e-1
+) {
+    let resultPtr = bufferC.contents().bindMemory(to: Float16.self, capacity: N)
+    let resultVector = Array(UnsafeBufferPointer(start: resultPtr, count: N))
+
+    for n in [0, N/2, N-1] {
+        var expected: Float = 0
+        for k in 0..<K {
+            expected += Float(vectorA[k]) * Float(matrixB[k * N + n])
+        }
+        let gpuValue = Float(resultVector[n])
+        print("C[0,\(n)]: GPU=\(gpuValue), CPU=\(expected)")
+        #expect(abs(gpuValue - expected) < epsilon, "Mismatch at (0,\(n))")
+    }
+}
+
+func verifyMatrixVectorResult(
+    bufferC: MTLBuffer, M: Int, K: Int,
+    matrixA: [Float16], vectorB: [Float16],
+    epsilon: Float = 1e-1
+) {
+    let resultPtr = bufferC.contents().bindMemory(to: Float16.self, capacity: M)
+    let resultVector = Array(UnsafeBufferPointer(start: resultPtr, count: M))
+
+    for m in [0, M/2, M-1] {
+        var expected: Float = 0
+        for k in 0..<K {
+            expected += Float(matrixA[m * K + k]) * Float(vectorB[k])
+        }
+        let gpuValue = Float(resultVector[m])
+        print("C[\(m),0]: GPU=\(gpuValue), CPU=\(expected)")
+        #expect(abs(gpuValue - expected) < epsilon, "Mismatch at (\(m),0)")
+    }
+}
+
+
+// MARK: - Metal 4 Tests
+
+struct Metal4Tests {
+    @Test func testSimdgroupMatrixMatrix() async throws {
+        let context = try TestContext()
+        let M = 128, N = 64, K = 256
+
+        let (bufferA, bufferB, bufferC, matrixA, matrixB) = try setupMatrixMatrixTest(device: context.device, M: M, N: N, K: K)
 
         let tensorA = try makeTensor(from: bufferA, rows: M, columns: K)
         let tensorB = try makeTensor(from: bufferB, rows: K, columns: N)
         let tensorC = try makeTensor(from: bufferC, rows: M, columns: N)
-        guard let commandBuffer = device.makeCommandBuffer() else {
-            throw TestError("Could not create command buffer")
-        }
-        let encoder = try ThreadMatrixMatrixEncoder(
-            device: device,
-            library: library,
-            compiler: compiler,
-            queue: commandQueue,
-            tensorA: tensorA,
-            tensorB: tensorB,
-            tensorC: tensorC
+
+        let encoder = try SimdMatrixMatrixEncoder(
+            device: context.device, library: context.library, compiler: context.compiler,
+            queue: context.commandQueue, tensorA: tensorA, tensorB: tensorB, tensorC: tensorC
         )
-        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
-        let start = ContinuousClock.now
-        encoder.encode(commandBuffer: commandBuffer)
-        commandBuffer.endCommandBuffer()
-        let commitOptionsCol = MTL4CommitOptions()
 
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            commitOptionsCol.addFeedbackHandler { feedback in
-                if feedback.error == nil {
-                    cont.resume()
-                } else {
-                    cont.resume(throwing: TestError("GPU execution failed with error: \(feedback.error!)"))
-                }
-            }
-            commandQueue.commit([commandBuffer], options: commitOptionsCol)
-        }
-        let elapsed = start.duration(to: ContinuousClock.now)
-        print("GPU time (ThreadMatmul): \(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) ms")
-        let resultBufferPointer = bufferC.contents().bindMemory(to: Float16.self, capacity: M * N)
-        let resultMatrix = Array(UnsafeBufferPointer(start: resultBufferPointer, count: M * N))
-
-        var cpuC = [Float](repeating: 0, count: M * N)
-        for m in 0..<M {
-            for n in 0..<N {
-                var sum: Float = 0
-                for k in 0..<K {
-                    let a = Float(matrixA[m * K + k])
-                    let b = Float(matrixB[k * N + n])
-                    sum += a * b
-                }
-                cpuC[m * N + n] = sum
-            }
+        try await executeAndWait(context: context, testName: "SimdgroupMatmul") { commandBuffer in
+            encoder.encode(commandBuffer: commandBuffer, M: M, N: N)
         }
 
-        let epsilon: Float = 1e-1
-        for (row, col) in [(0,0), (M-1,N-1), (M/2,N/2)] {
-            let gpuValue = Float(resultMatrix[row * N + col])
-            let cpuValue = cpuC[row * N + col]
-            print("C[\(row),\(col)]: GPU=\(gpuValue), CPU=\(cpuValue)")
-            #expect(abs(gpuValue - cpuValue) < epsilon, "Mismatch at (\(row),\(col))")
+        verifyMatrixMatrixResult(bufferC: bufferC, M: M, N: N, K: K, matrixA: matrixA, matrixB: matrixB)
+    }
+
+    @Test func testThreadMatrixMatrix() async throws {
+        let context = try TestContext()
+        let M = 64, N = 32, K = 32
+
+        let (bufferA, bufferB, bufferC, matrixA, matrixB) = try setupMatrixMatrixTest(device: context.device, M: M, N: N, K: K)
+
+        let tensorA = try makeTensor(from: bufferA, rows: M, columns: K)
+        let tensorB = try makeTensor(from: bufferB, rows: K, columns: N)
+        let tensorC = try makeTensor(from: bufferC, rows: M, columns: N)
+
+        let encoder = try ThreadMatrixMatrixEncoder(
+            device: context.device, library: context.library, compiler: context.compiler,
+            queue: context.commandQueue, tensorA: tensorA, tensorB: tensorB, tensorC: tensorC
+        )
+
+        try await executeAndWait(context: context, testName: "ThreadMatmul") { commandBuffer in
+            encoder.encode(commandBuffer: commandBuffer)
         }
+
+        verifyMatrixMatrixResult(bufferC: bufferC, M: M, N: N, K: K, matrixA: matrixA, matrixB: matrixB)
     }
 
     @Test func testThreadVectorMatix() async throws {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw TestError("Metal is not supported on this device")
-        }
-        guard device.supportsFamily(.metal4) else {
-            throw TestError("This device does not support the tensor operations used in the shader.")
-        }
-        guard let commandQueue = device.makeMTL4CommandQueue() else {
-            throw TestError("Could not create command queue")
-        }
-        guard let commandAllocator = device.makeCommandAllocator() else {
-            throw TestError("Could not create command allocator")
-        }
-        let compiler = try device.makeCompiler(descriptor: .init())
-        let library = try device.makeDefaultLibrary(bundle: .main)
-        // Test: vector (1 x K) × matrix (K x N) = (1 x N)
+        let context = try TestContext()
         let K = 31, N = 17
-        let sizeA = 1 * K * MemoryLayout<Float16>.size
-        let sizeB = K * N * MemoryLayout<Float16>.size
-        let sizeC = 1 * N * MemoryLayout<Float16>.size
-        guard let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared) else { throw TestError("Could not create buffer A")}
-        guard let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared) else { throw TestError("Could not create buffer B")}
-        guard let bufferC = device.makeBuffer(length: sizeC, options: .storageModeShared) else { throw TestError("Could not create buffer C")}
 
-        var matrixA = [Float16](repeating: 0, count: K)
-        var matrixB = [Float16](repeating: 0, count: K*N)
-        for i in 0..<K { matrixA[i] = Float16.random(in: 0...1) }
-        for i in 0..<(K*N) { matrixB[i] = Float16.random(in: 0...1) }
-
-        bufferA.contents().copyMemory(from: matrixA, byteCount: sizeA)
-        bufferB.contents().copyMemory(from: matrixB, byteCount: sizeB)
-        bufferC.contents().initializeMemory(as: UInt8.self, repeating: 0, count: sizeC)
+        let (bufferA, bufferB, bufferC, vectorA, matrixB) = try setupVectorMatrixTest(device: context.device, K: K, N: N)
 
         let tensorA = try makeTensor(from: bufferA, rows: 1, columns: K)
         let tensorB = try makeTensor(from: bufferB, rows: K, columns: N)
         let tensorC = try makeTensor(from: bufferC, rows: 1, columns: N)
 
-        guard let commandBuffer = device.makeCommandBuffer() else {
-            throw TestError("Could not create command buffer")
-        }
-
         let encoder = try ThreadVectorMatrixEncoder(
-            device: device,
-            library: library,
-            compiler: compiler,
-            queue: commandQueue,
-            tensorA: tensorA,
-            tensorB: tensorB,
-            tensorC: tensorC
+            device: context.device, library: context.library, compiler: context.compiler,
+            queue: context.commandQueue, tensorA: tensorA, tensorB: tensorB, tensorC: tensorC
         )
 
-        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
-        let start = ContinuousClock.now
-        encoder.encode(commandBuffer: commandBuffer)
-        commandBuffer.endCommandBuffer()
-        let commitOptionsCol = MTL4CommitOptions()
-
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            commitOptionsCol.addFeedbackHandler { feedback in
-                if feedback.error == nil {
-                    cont.resume()
-                } else {
-                    cont.resume(throwing: TestError("GPU execution failed with error: \(feedback.error!)"))
-                }
-            }
-            commandQueue.commit([commandBuffer], options: commitOptionsCol)
-        }
-    
-        let elapsed = start.duration(to: ContinuousClock.now)
-        print("GPU time (VectorMatmul): \(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) ms")
-        let resultBufferPointer = bufferC.contents().bindMemory(to: Float16.self, capacity: N)
-        let resultVector = Array(UnsafeBufferPointer(start: resultBufferPointer, count: N))
-
-        var cpuC = [Float](repeating: 0, count: N)
-        for n in 0..<N {
-            var sum: Float = 0
-            for k in 0..<K {
-                let a = Float(matrixA[k])
-                let b = Float(matrixB[k*N + n])
-                sum += a * b
-            }
-            cpuC[n] = sum
+        try await executeAndWait(context: context, testName: "ThreadVectorMatrix") { commandBuffer in
+            encoder.encode(commandBuffer: commandBuffer)
         }
 
-        let epsilon: Float = 1e-1
-        for n in [0, N/2, N-1] {
-            let gpuValue = Float(resultVector[n])
-            let cpuValue = cpuC[n]
-            print("C[0,\(n)]: GPU=\(gpuValue), CPU=\(cpuValue)")
-            #expect(abs(gpuValue - cpuValue) < epsilon, "Mismatch at (0,\(n))")
-        }
+        verifyVectorMatrixResult(bufferC: bufferC, N: N, K: K, vectorA: vectorA, matrixB: matrixB)
     }
     
     @Test func testThreadMatrixVector() async throws {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw TestError("Metal is not supported on this device")
-        }
-        guard device.supportsFamily(.metal4) else {
-            throw TestError("This device does not support the tensor operations used in the shader.")
-        }
-        guard let commandQueue = device.makeMTL4CommandQueue() else {
-            throw TestError("Could not create command queue")
-        }
-        guard let commandAllocator = device.makeCommandAllocator() else {
-            throw TestError("Could not create command allocator")
-        }
-        let compiler = try device.makeCompiler(descriptor: .init())
-        let library = try device.makeDefaultLibrary(bundle: .main)
-        // Test: matrix (M x K) × vector (K x 1) = vector (M x 1)
+        let context = try TestContext()
         let M = 29, K = 19
-        let sizeA = M * K * MemoryLayout<Float16>.size
-        let sizeB = K * 1 * MemoryLayout<Float16>.size
-        let sizeC = M * 1 * MemoryLayout<Float16>.size
-        guard let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared) else { throw TestError("Could not create buffer A")}
-        guard let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared) else { throw TestError("Could not create buffer B")}
-        guard let bufferC = device.makeBuffer(length: sizeC, options: .storageModeShared) else { throw TestError("Could not create buffer C")}
 
-        var matrixA = [Float16](repeating: 0, count: M * K)
-        var matrixB = [Float16](repeating: 0, count: K)
-        for i in 0..<(M * K) { matrixA[i] = Float16.random(in: 0...1) }
-        for i in 0..<K { matrixB[i] = Float16.random(in: 0...1) }
-
-        bufferA.contents().copyMemory(from: matrixA, byteCount: sizeA)
-        bufferB.contents().copyMemory(from: matrixB, byteCount: sizeB)
-        bufferC.contents().initializeMemory(as: UInt8.self, repeating: 0, count: sizeC)
+        let (bufferA, bufferB, bufferC, matrixA, vectorB) = try setupMatrixVectorTest(device: context.device, M: M, K: K)
 
         let tensorA = try makeTensor(from: bufferA, rows: M, columns: K)
         let tensorB = try makeTensor(from: bufferB, rows: K, columns: 1)
         let tensorC = try makeTensor(from: bufferC, rows: M, columns: 1)
 
-        guard let commandBuffer = device.makeCommandBuffer() else {
-            throw TestError("Could not create command buffer")
-        }
-
         let encoder = try ThreadMatrixVectorEncoder(
-            device: device,
-            library: library,
-            compiler: compiler,
-            queue: commandQueue,
-            tensorA: tensorA,
-            tensorB: tensorB,
-            tensorC: tensorC
+            device: context.device, library: context.library, compiler: context.compiler,
+            queue: context.commandQueue, tensorA: tensorA, tensorB: tensorB, tensorC: tensorC
         )
 
-        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
-        let start = ContinuousClock.now
-        encoder.encode(commandBuffer: commandBuffer)
-        commandBuffer.endCommandBuffer()
-        let commitOptionsCol = MTL4CommitOptions()
-
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            commitOptionsCol.addFeedbackHandler { feedback in
-                if feedback.error == nil {
-                    cont.resume()
-                } else {
-                    cont.resume(throwing: TestError("GPU execution failed with error: \(feedback.error!)"))
-                }
-            }
-            commandQueue.commit([commandBuffer], options: commitOptionsCol)
-        }
-    
-        let elapsed = start.duration(to: ContinuousClock.now)
-        print("GPU time (ThreadMatrixVector): \(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) ms")
-        let resultBufferPointer = bufferC.contents().bindMemory(to: Float16.self, capacity: M)
-        let resultVector = Array(UnsafeBufferPointer(start: resultBufferPointer, count: M))
-
-        var cpuC = [Float](repeating: 0, count: M)
-        for m in 0..<M {
-            var sum: Float = 0
-            for k in 0..<K {
-                let a = Float(matrixA[m * K + k])
-                let b = Float(matrixB[k])
-                sum += a * b
-            }
-            cpuC[m] = sum
+        try await executeAndWait(context: context, testName: "ThreadMatrixVector") { commandBuffer in
+            encoder.encode(commandBuffer: commandBuffer)
         }
 
-        let epsilon: Float = 1e-1
-        for m in [0, M/2, M-1] {
-            let gpuValue = Float(resultVector[m])
-            let cpuValue = cpuC[m]
-            print("C[\(m),0]: GPU=\(gpuValue), CPU=\(cpuValue)")
-            #expect(abs(gpuValue - cpuValue) < epsilon, "Mismatch at (\(m),0)")
-        }
+        verifyMatrixVectorResult(bufferC: bufferC, M: M, K: K, matrixA: matrixA, vectorB: vectorB)
     }
 }
-
