@@ -23,8 +23,8 @@ kernel void sirenMLP(
 ) {
     const half2 xy = (half2(gid) + 0.5h) / half2(outTexture.get_width(), outTexture.get_height()) * 2.0h - 1.0h;
 
-    thread half inputMem[HIDDEN_DIM] = { xy.x, xy.y }; // doesn't work when set to INPUT_DIM
-    auto input = tensor(inputMem, dextents<int, 2>(HIDDEN_DIM, 1)); //  doesn't work when set to INPUT_DIM
+    thread half inputMem[HIDDEN_DIM] = { xy.x, xy.y };
+    auto input = tensor(inputMem, dextents<int, 2>(HIDDEN_DIM, 1));
 
     thread half hiddenMem[HIDDEN_DIM];
     auto hidden = tensor(hiddenMem, dextents<int, 2>(HIDDEN_DIM, 1));
