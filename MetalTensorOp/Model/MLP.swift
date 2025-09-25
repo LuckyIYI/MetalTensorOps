@@ -94,7 +94,7 @@ struct MLPParameterLayer: Codable {
         var biasArray = [Float16](repeating: 0, count: biasCount)
         biasTensor.getBytes(
             &biasArray,
-            strides: biasTensor.strides,
+            strides: biasTensor.strides!,
             sliceOrigin: MTLTensorExtents([0])!,
             sliceDimensions: biasTensor.dimensions)
 
