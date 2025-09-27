@@ -25,6 +25,7 @@ final class SirenEncoder: ComputeEncoder {
     private let mlp: MLP
     private var timeBuffer: MTLBuffer
     private let tensorArgumentsBuffer: MTLBuffer
+    private let layerCountBuffer: MTLBuffer
 
     init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
@@ -76,10 +77,11 @@ final class SirenEncoder: ComputeEncoder {
         memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<MLPTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
-        guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size) else {
+        guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer
         }
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
+        self.layerCountBuffer = layerCountBuffer
 
         guard let timeBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer

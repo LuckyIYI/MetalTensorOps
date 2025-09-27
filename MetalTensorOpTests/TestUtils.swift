@@ -6,18 +6,57 @@ struct TestError: Error, CustomStringConvertible {
     init(_ description: String) { self.description = description }
 }
 
-func makeTensor(from buffer: MTLBuffer, rows: Int, columns: Int) throws -> MTLTensor {
-    guard let extents = MTLTensorExtents([columns, rows]) else {
+enum TensorMemoryLayout {
+    case columnMajor
+    case rowMajor
+}
+
+func makeTensor(
+    from buffer: MTLBuffer,
+    rows: Int,
+    columns: Int,
+    layout: TensorMemoryLayout = .columnMajor
+) throws -> MTLTensor {
+    let extents: MTLTensorExtents?
+    let strides: MTLTensorExtents?
+
+    switch layout {
+    case .columnMajor:
+        extents = MTLTensorExtents([columns, rows])
+        strides = MTLTensorExtents([1, columns])
+    case .rowMajor:
+        extents = MTLTensorExtents([rows, columns])
+        strides = MTLTensorExtents([1, rows])
+    }
+
+    guard let tensorExtents = extents else {
         throw TestError("Failed to create extents for a \(rows)x\(columns) tensor")
     }
 
-    guard let strides = MTLTensorExtents([1, columns]) else {
+    guard let tensorStrides = strides else {
         throw TestError("Failed to create strides for a \(rows)x\(columns) tensor")
     }
+
+    let descriptor = MTLTensorDescriptor()
+    descriptor.dimensions = tensorExtents
+    descriptor.usage = .compute
+    descriptor.strides = tensorStrides
+    descriptor.dataType = .float16
+    return try buffer.makeTensor(descriptor: descriptor, offset: 0)
+}
+
+func makeVectorTensor(from buffer: MTLBuffer, length: Int) throws -> MTLTensor {
+    guard let extents = MTLTensorExtents([length]) else {
+        throw TestError("Failed to create extents for a vector of length \(length)")
+    }
+    guard let strides = MTLTensorExtents([1]) else {
+        throw TestError("Failed to create strides for a vector of length \(length)")
+    }
+
     let descriptor = MTLTensorDescriptor()
     descriptor.dimensions = extents
     descriptor.usage = .compute
-    descriptor.strides  = strides
+    descriptor.strides = strides
     descriptor.dataType = .float16
     return try buffer.makeTensor(descriptor: descriptor, offset: 0)
 }
@@ -218,4 +257,3 @@ func verifyMatrixVectorResult(
         #expect(abs(gpuValue - expected) < epsilon, "Mismatch at (\(m),0)")
     }
 }
-

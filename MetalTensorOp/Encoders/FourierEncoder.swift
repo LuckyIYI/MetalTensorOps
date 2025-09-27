@@ -29,6 +29,8 @@ final class FourierEncoder: ComputeEncoder {
     private let fourier: FourierParams
     private var timeBuffer: MTLBuffer
     private let tensorArgumentsBuffer: MTLBuffer
+    private let layerCountBuffer: MTLBuffer
+    private let sigmaBuffer: MTLBuffer
 
     init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
@@ -75,11 +77,12 @@ final class FourierEncoder: ComputeEncoder {
         memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<FourierTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
-        guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size) else {
+        guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared) else {
             throw FourierEncoderError.failedToCreateBuffer
         }
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
- 
+        self.layerCountBuffer = layerCountBuffer
+
         guard let timeBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared) else {
             throw FourierEncoderError.failedToCreateBuffer
         }
@@ -90,6 +93,7 @@ final class FourierEncoder: ComputeEncoder {
         }
         var sigmaCopy = sigma
         memcpy(sigmaBuffer.contents(), &sigmaCopy, MemoryLayout<Float>.stride)
+        self.sigmaBuffer = sigmaBuffer
 
         self.argumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
         self.argumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
@@ -118,6 +122,7 @@ final class FourierEncoder: ComputeEncoder {
         }
         residency.addAllocation(tensorArgumentsBuffer)
         residency.addAllocation(timeBuffer)
+        residency.addAllocation(sigmaBuffer)
 
         residency.commit()
         self.residencySet = residency
