@@ -139,7 +139,7 @@ final class FourierEncoder: ComputeEncoder {
         argumentTable.setTexture(drawableTexture.gpuResourceID, index: 0)
         encoder.dispatchThreads(
             threadsPerGrid: .init(width: drawableTexture.width, height: drawableTexture.height, depth: 1),
-            threadsPerThreadgroup: .init(width: 32, height: 32, depth: 1)
+            threadsPerThreadgroup: .init(width: 16, height: 16, depth: 1)
         )
         encoder.endEncoding()
     }

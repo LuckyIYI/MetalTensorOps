@@ -1,10 +1,12 @@
 #include <metal_stdlib>
-using namespace metal;
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_numeric>
-using namespace mpp;
 
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+// Compile-time dimensions
 #define INPUT_DIM 2
 #define HIDDEN_DIM 32
 #define OUTPUT_DIM 1
@@ -35,9 +37,9 @@ kernel void sirenMLP(
     constexpr half FIRST_OMEGA0 = 30.0h;
     constexpr half HIDDEN_OMEGA0 = 1.0h;
 
-    constexpr tensor_ops::matmul2d_descriptor inputDesc(1, HIDDEN_DIM,  INPUT_DIM, false, false, true);
-    constexpr tensor_ops::matmul2d_descriptor hiddenDesc(1, HIDDEN_DIM, HIDDEN_DIM, false, false, true);
-    constexpr tensor_ops::matmul2d_descriptor outputDesc(1, OUTPUT_DIM, HIDDEN_DIM, false, false, true);
+    constexpr matmul2d_descriptor inputDesc(1, HIDDEN_DIM,  INPUT_DIM, false, false, true);
+    constexpr matmul2d_descriptor hiddenDesc(1, HIDDEN_DIM, HIDDEN_DIM, false, false, true);
+    constexpr matmul2d_descriptor outputDesc(1, OUTPUT_DIM, HIDDEN_DIM, false, false, true);
 
     for (uint layerIndex = 0; layerIndex < mlpLayerCount; ++layerIndex) {
         auto weights = mlpLayers.weights[layerIndex];
@@ -47,13 +49,13 @@ kernel void sirenMLP(
 
         if (layerIndex == 0) {
             // First layer: input -> hidden
-            tensor_ops::matmul2d<inputDesc, execution_thread>{}.run(input, weights, hidden);
+            matmul2d<inputDesc, execution_thread>{}.run(input, weights, hidden);
         } else if (isLastLayer) {
             // Last layer: hidden -> output
-            tensor_ops::matmul2d<outputDesc, execution_thread>{}.run(input, weights, output);
+            matmul2d<outputDesc, execution_thread>{}.run(input, weights, output);
         } else {
             // Hidden layers: hidden -> hidden
-            tensor_ops::matmul2d<hiddenDesc, execution_thread>{}.run(input, weights, hidden);
+            matmul2d<hiddenDesc, execution_thread>{}.run(input, weights, hidden);
         }
 
         const uint outputDim = isLastLayer ? OUTPUT_DIM : HIDDEN_DIM;

@@ -3,7 +3,7 @@ using namespace metal;
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_numeric>
-using namespace mpp;
+using namespace mpp::tensor_ops;
 
 #define INPUT_DIM 2
 #define NUM_FREQ 64
@@ -51,9 +51,9 @@ kernel void fourierMLP(
     thread half outputMem[OUTPUT_DIM];
     auto output = tensor(outputMem, dextents<int, 2>(OUTPUT_DIM, 1));
 
-    constexpr tensor_ops::matmul2d_descriptor inputDesc(1, HIDDEN_DIM, NUM_FREQ * 2, false, false, true);
-    constexpr tensor_ops::matmul2d_descriptor hiddenDesc(1, HIDDEN_DIM, HIDDEN_DIM, false, false, true);
-    constexpr tensor_ops::matmul2d_descriptor outputDesc(1, OUTPUT_DIM, HIDDEN_DIM, false, false, true);
+    constexpr matmul2d_descriptor inputDesc(1, HIDDEN_DIM, NUM_FREQ * 2, false, false, true);
+    constexpr matmul2d_descriptor hiddenDesc(1, HIDDEN_DIM, HIDDEN_DIM, false, false, true);
+    constexpr matmul2d_descriptor outputDesc(1, OUTPUT_DIM, HIDDEN_DIM, false, false, true);
 
     for (uint layerIndex = 0; layerIndex < mlpLayerCount; ++layerIndex) {
         auto weigts = mlpLayers.weigts[layerIndex];
@@ -62,7 +62,7 @@ kernel void fourierMLP(
 
         if (layerIndex == 0) {
             auto input_tensor = tensor(current_activation, dextents<int, 2>(NUM_FREQ * 2, 1));
-            tensor_ops::matmul2d<inputDesc, execution_thread>{}.run(input_tensor, weigts, hidden);
+            matmul2d<inputDesc, execution_thread>{}.run(input_tensor, weigts, hidden);
             for (uint i = 0; i < HIDDEN_DIM; ++i) {
                 float val = float(hidden[i, 0] + biases[i]);
                 current_activation[i] = half(max(val, 0.0f));
@@ -70,12 +70,12 @@ kernel void fourierMLP(
         } else {
             auto input_tensor = tensor(current_activation, dextents<int, 2>(HIDDEN_DIM, 1));
             if (isLastLayer) {
-                tensor_ops::matmul2d<outputDesc, execution_thread>{}.run(input_tensor, weigts, output);
+                matmul2d<outputDesc, execution_thread>{}.run(input_tensor, weigts, output);
                 for (uint i = 0; i < OUTPUT_DIM; ++i) {
                     current_activation[i] = output[i, 0] + biases[i];
                 }
             } else {
-                tensor_ops::matmul2d<hiddenDesc, execution_thread>{}.run(input_tensor, weigts, hidden);
+                matmul2d<hiddenDesc, execution_thread>{}.run(input_tensor, weigts, hidden);
                 for (uint i = 0; i < HIDDEN_DIM; ++i) {
                     float val = float(hidden[i, 0] + biases[i]);
                     current_activation[i] = half(max(val, 0.0f));

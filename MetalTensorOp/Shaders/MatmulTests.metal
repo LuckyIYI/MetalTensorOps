@@ -180,3 +180,113 @@ kernel void threadMLP(
         outputTensor[o, 0] = half(sum);
     }
 }
+
+
+#define THREAD_DYNAMIC_MLP_MAX_LAYERS 8
+#define THREAD_DYNAMIC_MLP_INPUT_DIM 4
+#define THREAD_DYNAMIC_MLP_HIDDEN_DIM 32
+#define THREAD_DYNAMIC_MLP_OUTPUT_DIM 8
+
+struct ThreadDynamicMLPMetadata {
+    uint inputDim;
+    uint hiddenDim;
+    uint outputDim;
+    uint hiddenLayerCount; // Number of hidden layers (not including input/output)
+};
+
+// Dynamic MLP with loop and runtime tensor dimensions (EXACT pattern from SirenMLP)
+struct DynamicMLPLayers {
+    tensor<device half, dextents<int, 2>> weights[THREAD_DYNAMIC_MLP_MAX_LAYERS];
+    tensor<constant half, dextents<int, 1>> biases[THREAD_DYNAMIC_MLP_MAX_LAYERS];
+};
+
+kernel void threadDynamicMLP(
+    constant DynamicMLPLayers &layers [[buffer(0)]],
+    tensor<device half, dextents<int, 2>> inputTensor [[buffer(1)]],
+    tensor<device half, dextents<int, 2>> outputTensor [[buffer(2)]],
+    constant ThreadDynamicMLPMetadata &metadata [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint inputDim = metadata.inputDim;
+    const uint hiddenDim = metadata.hiddenDim;
+    const uint outputDim = metadata.outputDim;
+    const uint hiddenLayerCount = metadata.hiddenLayerCount;
+
+    // Total layers = 1 input->hidden + (hiddenLayerCount-1) hidden->hidden + 1 hidden->output
+    const uint totalLayers = hiddenLayerCount + 1;
+
+    if (totalLayers == 0 || totalLayers > THREAD_DYNAMIC_MLP_MAX_LAYERS) {
+        return;
+    }
+
+    // Allocate buffers (input goes in one, hidden in the other, ping-pong)
+    thread half inputBuffer[THREAD_DYNAMIC_MLP_INPUT_DIM] = {};
+    thread half hiddenA[THREAD_DYNAMIC_MLP_HIDDEN_DIM] = {};
+    thread half hiddenB[THREAD_DYNAMIC_MLP_HIDDEN_DIM] = {};
+    thread half outputBuffer[THREAD_DYNAMIC_MLP_OUTPUT_DIM] = {};
+
+    // Load input
+    for (uint i = 0; i < inputDim; ++i) {
+        inputBuffer[i] = inputTensor[i, 0];
+    }
+
+    thread half *currentActivations = inputBuffer;
+    thread half *nextHiddenBuffer = hiddenA;
+    uint currentDim = inputDim;
+
+    // MatMul descriptors matching SirenMLP
+    constexpr matmul2d_descriptor matDesc_in2hid(1, THREAD_DYNAMIC_MLP_HIDDEN_DIM, THREAD_DYNAMIC_MLP_INPUT_DIM, false, false, true);
+    constexpr matmul2d_descriptor matDesc_hid2hid(1, THREAD_DYNAMIC_MLP_HIDDEN_DIM, THREAD_DYNAMIC_MLP_HIDDEN_DIM, false, false, true);
+    constexpr matmul2d_descriptor matDesc_hid2out(1, THREAD_DYNAMIC_MLP_OUTPUT_DIM, THREAD_DYNAMIC_MLP_HIDDEN_DIM, false, false, true);
+
+    // Process all layers
+    for (uint layerIdx = 0; layerIdx < totalLayers; ++layerIdx) {
+        const bool isFirst = (layerIdx == 0);
+        const bool isLast = (layerIdx == totalLayers - 1);
+
+        // Determine output dimension and buffer
+        const uint targetDim = isLast ? outputDim : hiddenDim;
+        thread half *layerOut = isLast ? outputBuffer : nextHiddenBuffer;
+
+        // Create tensors with RUNTIME dimensions
+        auto inT = tensor(currentActivations, dextents<int, 2>(currentDim, 1));
+        auto outT = tensor(layerOut, dextents<int, 2>(targetDim, 1));
+
+        // Get weight and bias for this layer
+        auto W = layers.weights[layerIdx];
+        auto b = layers.biases[layerIdx];
+
+        // Run matmul with appropriate descriptor
+        if (isLast) {
+            matmul2d<matDesc_hid2out, execution_thread>{}.run(inT, W, outT);
+        } else if (isFirst) {
+            matmul2d<matDesc_in2hid, execution_thread>{}.run(inT, W, outT);
+        } else {
+            matmul2d<matDesc_hid2hid, execution_thread>{}.run(inT, W, outT);
+        }
+
+        // Apply bias and activation (ReLU for hidden, linear for output)
+        for (uint i = 0; i < targetDim; ++i) {
+            float sum = float(outT[i, 0]) + float(b[i]);
+            if (isLast) {
+                layerOut[i] = half(sum); // Linear output
+            } else {
+                layerOut[i] = half(max(sum, 0.0f)); // ReLU
+            }
+        }
+
+        // Advance pointers
+        currentActivations = layerOut;
+        currentDim = targetDim;
+
+        // Ping-pong hidden buffers for next hidden layer
+        if (!isLast) {
+            nextHiddenBuffer = (layerOut == hiddenA) ? hiddenB : hiddenA;
+        }
+    }
+
+    // Write output
+    for (uint o = 0; o < outputDim; ++o) {
+        outputTensor[o, 0] = outputBuffer[o];
+    }
+}

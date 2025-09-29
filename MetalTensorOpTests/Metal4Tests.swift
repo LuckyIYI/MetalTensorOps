@@ -215,4 +215,145 @@ struct Metal4Tests {
 
         verifyMatrixVectorResult(bufferC: bufferC, M: M, K: K, matrixA: matrixA, vectorB: vectorB)
     }
+
+    @Test(.timeLimit(.minutes(1))) func testThreadDynamicMLP() async throws {
+        let context = try TestContext()
+
+        // Architecture: INPUT_DIM -> HIDDEN_DIM x hiddenLayerCount -> OUTPUT_DIM
+        let inputDim: UInt32 = 4
+        let hiddenDim: UInt32 = 32
+        let outputDim: UInt32 = 8
+        let hiddenLayerCount: UInt32 = 2  // 2 hidden layers
+
+        // Total layers = hiddenLayerCount + 1 (output layer)
+        // Layer 0: input(4) -> hidden(32)
+        // Layer 1: hidden(32) -> hidden(32)
+        // Layer 2: hidden(32) -> output(8)
+        let totalLayers = Int(hiddenLayerCount + 1)
+
+        // Create test data for each layer
+        var allWeights: [[[Float]]] = []
+        var allBiases: [[Float]] = []
+
+        for i in 0..<totalLayers {
+            let isFirst = (i == 0)
+            let isLast = (i == totalLayers - 1)
+
+            let inDim = isFirst ? Int(inputDim) : Int(hiddenDim)
+            let outDim = isLast ? Int(outputDim) : Int(hiddenDim)
+
+            allWeights.append(makeTestMatrix(rows: outDim, columns: inDim, seed: Float(i) * 1.5 + 1.0))
+            allBiases.append(makeTestVector(length: outDim, seed: Float(i) * 2.0 + 3.0))
+        }
+
+        let inputFloats = makeTestVector(length: Int(inputDim), seed: 0.25)
+        let inputHalf = inputFloats.map(Float16.init)
+
+        func flattenColumnMajor(_ matrix: [[Float]]) -> [Float16] {
+            let rows = matrix.count
+            let cols = matrix.first?.count ?? 0
+            var flattened = [Float16]()
+            flattened.reserveCapacity(rows * cols)
+            for c in 0..<cols {
+                for r in 0..<rows {
+                    flattened.append(Float16(matrix[r][c]))
+                }
+            }
+            return flattened
+        }
+
+        // Create buffers for weights and biases
+        var weightBuffers: [MTLBuffer] = []
+        var biasBuffers: [MTLBuffer] = []
+        var weightTensors: [MTLTensor] = []
+        var biasTensors: [MTLTensor] = []
+
+        for i in 0..<totalLayers {
+            let isFirst = (i == 0)
+            let isLast = (i == totalLayers - 1)
+
+            let inDim = isFirst ? Int(inputDim) : Int(hiddenDim)
+            let outDim = isLast ? Int(outputDim) : Int(hiddenDim)
+
+            let weightsFlat = flattenColumnMajor(allWeights[i])
+            let biasHalf = allBiases[i].map(Float16.init)
+
+            guard let wBuf = context.device.makeBuffer(bytes: weightsFlat, length: weightsFlat.count * MemoryLayout<Float16>.stride, options: .storageModeShared),
+                  let bBuf = context.device.makeBuffer(bytes: biasHalf, length: biasHalf.count * MemoryLayout<Float16>.stride, options: .storageModeShared) else {
+                throw TestError("Failed to allocate buffer for layer \(i)")
+            }
+
+            weightBuffers.append(wBuf)
+            biasBuffers.append(bBuf)
+
+            let wTensor = try makeTensor(from: wBuf, rows: outDim, columns: inDim, layout: .rowMajor)
+            let bTensor = try makeVectorTensor(from: bBuf, length: outDim)
+
+            weightTensors.append(wTensor)
+            biasTensors.append(bTensor)
+        }
+
+        // Create input/output buffers
+        guard let inputBuffer = context.device.makeBuffer(bytes: inputHalf, length: inputHalf.count * MemoryLayout<Float16>.stride, options: .storageModeShared),
+              let outputBuffer = context.device.makeBuffer(length: Int(outputDim) * MemoryLayout<Float16>.stride, options: .storageModeShared) else {
+            throw TestError("Failed to allocate input/output buffers")
+        }
+
+        outputBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: Int(outputDim) * MemoryLayout<Float16>.stride)
+
+        let tensorInput = try makeTensor(from: inputBuffer, rows: Int(inputDim), columns: 1, layout: .rowMajor)
+        let tensorOutput = try makeTensor(from: outputBuffer, rows: Int(outputDim), columns: 1, layout: .rowMajor)
+
+        let encoder = try ThreadDynamicMLPEncoder(
+            device: context.device,
+            library: context.library,
+            compiler: context.compiler,
+            queue: context.commandQueue,
+            weightTensors: weightTensors,
+            biasTensors: biasTensors,
+            input: tensorInput,
+            output: tensorOutput,
+            inputDim: inputDim,
+            hiddenDim: hiddenDim,
+            outputDim: outputDim,
+            hiddenLayerCount: hiddenLayerCount
+        )
+
+        // Execute with timeout
+        print("Running dynamic MLP test: \(inputDim) -> [\(hiddenDim) x \(hiddenLayerCount)] -> \(outputDim)")
+        try await executeAndWait(context: context, testName: "ThreadDynamicMLP") { commandBuffer in
+            encoder.encode(commandBuffer: commandBuffer)
+        }
+
+        // Verify results
+        let resultPtr = outputBuffer.contents().bindMemory(to: Float16.self, capacity: Int(outputDim))
+        let gpuOutput = (0..<Int(outputDim)).map { Float(resultPtr[$0]) }
+        print("GPU output (float):", gpuOutput)
+
+        // CPU reference computation
+        var currentActivations = inputFloats
+        for i in 0..<totalLayers {
+            let isLast = (i == totalLayers - 1)
+            let outDim = isLast ? Int(outputDim) : Int(hiddenDim)
+            var nextActivations = [Float](repeating: 0, count: outDim)
+
+            for o in 0..<outDim {
+                var acc = allBiases[i][o]
+                for j in 0..<currentActivations.count {
+                    acc += allWeights[i][o][j] * currentActivations[j]
+                }
+                // ReLU for hidden layers, linear for output
+                nextActivations[o] = isLast ? acc : max(acc, 0)
+            }
+
+            currentActivations = nextActivations
+        }
+
+        // Compare
+        for idx in 0..<Int(outputDim) {
+            let diff = abs(gpuOutput[idx] - currentActivations[idx])
+            print("Index \(idx) -> GPU=\(gpuOutput[idx]) CPU=\(currentActivations[idx]) diff=\(diff)")
+            #expect(diff < 5e-2, "Mismatch at index \(idx) (GPU=\(gpuOutput[idx]), CPU=\(currentActivations[idx]), diff=\(diff))")
+        }
+    }
 }
