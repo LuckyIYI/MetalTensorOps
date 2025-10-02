@@ -3,6 +3,12 @@ import Combine
 import Metal
 import MetalKit
 
+enum ModelKind: String, CaseIterable {
+    case siren = "Siren"
+    case fourier = "Fourier"
+    case instantNGP = "Instant NGP"
+}
+
 struct ModelKindKey: EnvironmentKey {
     static let defaultValue: ModelKind = .siren
 }
@@ -181,29 +187,47 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
             return
         }
 
+        imageWidth = nil
+        imageHeight = nil
+        aspectRatio = nil
+
         do {
             switch modelKind {
             case .siren:
                 encoder = try SirenEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
+                loadMetadata(resourceName: "siren")
             case .fourier:
                 encoder = try FourierEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
+                loadMetadata(resourceName: "fourier")
+            case .instantNGP:
+                guard let weightsFile = loadInstantNGPWeightsFile() else {
+                    print("[Coordinator] Instant NGP weights unavailable")
+                    drawingEnabled = false
+                    return
+                }
+
+                let metalWeights = try weightsFile.makeMetalWeights(device: device)
+                let instantEncoder = try InstantNGPEncoder(
+                    device: device,
+                    library: library,
+                    compiler: compiler,
+                    queue: commandQueue,
+                    weights: metalWeights
+                )
+                if let image = weightsFile.metadata.image,
+                   let width = image.width,
+                   let height = image.height {
+                    imageWidth = width
+                    imageHeight = height
+                    aspectRatio = CGFloat(width) / CGFloat(height)
+                }
+                encoder = instantEncoder
             }
         } catch {
+
             print("[Coordinator] Failed to initialize encoder for \(modelKind): \(error)")
             drawingEnabled = false
             return
-        }
-
-        if let url = Bundle.main.url(forResource: modelKind == .fourier ? "fourier" : "siren", withExtension: "json") {
-            if let data = try? Data(contentsOf: url),
-               let model = try? JSONDecoder().decode(ModelFile.self, from: data),
-               let imageMeta = model.metadata?.image {
-                if let width = imageMeta.width, let height = imageMeta.height {
-                    self.imageWidth = width
-                    self.imageHeight = height
-                    self.aspectRatio = CGFloat(width) / CGFloat(height)
-                }
-            }
         }
 
         guard let commandBuffer = device.makeCommandBuffer() else {
@@ -278,6 +302,41 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
         commandQueue.signalEvent(sharedEvent!, value: valueToSignal)
         
         frameNumber += 1
+    }
+}
+
+extension Coordinator {
+    private func loadMetadata(resourceName: String) {
+        guard let url = Bundle.main.url(forResource: resourceName, withExtension: "json") else {
+            return
+        }
+
+        guard let data = try? Data(contentsOf: url),
+              let model = try? JSONDecoder().decode(ModelFile.self, from: data),
+              let imageMeta = model.metadata?.image,
+              let width = imageMeta.width,
+              let height = imageMeta.height else {
+            return
+        }
+
+        imageWidth = width
+        imageHeight = height
+        aspectRatio = CGFloat(width) / CGFloat(height)
+    }
+
+    private func loadInstantNGPWeightsFile() -> InstantNGPWeightsFile? {
+        guard let url = Bundle.main.url(forResource: "instant_ngp", withExtension: "json") else {
+            print("[Coordinator] instant_ngp.json not found in bundle")
+            return nil
+        }
+
+        do {
+            let weights = try InstantNGPWeightsFile.load(from: url)
+            return weights
+        } catch {
+            print("[Coordinator] Failed to load Instant NGP weights: \(error)")
+            return nil
+        }
     }
 }
 

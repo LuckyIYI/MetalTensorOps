@@ -15,7 +15,8 @@ func makeTensor(
     from buffer: MTLBuffer,
     rows: Int,
     columns: Int,
-    layout: TensorMemoryLayout = .columnMajor
+    layout: TensorMemoryLayout = .columnMajor,
+    dataType: MTLTensorDataType = .float16
 ) throws -> MTLTensor {
     let extents: MTLTensorExtents?
     let strides: MTLTensorExtents?
@@ -41,7 +42,7 @@ func makeTensor(
     descriptor.dimensions = tensorExtents
     descriptor.usage = .compute
     descriptor.strides = tensorStrides
-    descriptor.dataType = .float16
+    descriptor.dataType = dataType
     return try buffer.makeTensor(descriptor: descriptor, offset: 0)
 }
 

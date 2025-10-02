@@ -36,9 +36,7 @@ final class SirenEncoder: ComputeEncoder {
         pipelineDescriptor.computeFunctionDescriptor = functionDescriptor
         
         self.pipelineState = try compiler.makeComputePipelineState(descriptor: pipelineDescriptor)
-        
-        self.pipelineState.reflection?.bindings.forEach { print($0) }
-        
+                
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
         tableDesc.maxBufferBindCount = 3
