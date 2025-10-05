@@ -51,8 +51,8 @@ inline void compute_hash_encoding_2d(
     thread float *encoded_features,
     uint level
 ) {
-    const float ln_min = log((float)NGP_BASE_RESOLUTION);
-    const float ln_max = log((float)NGP_MAX_RESOLUTION);
+    const float ln_min = floor(log((float)NGP_BASE_RESOLUTION));
+    const float ln_max = floor(log((float)NGP_MAX_RESOLUTION));
     const float t = (NGP_NUM_LEVELS > 1) ? (float(level) / float(NGP_NUM_LEVELS - 1)) : 0.0f;
     const float scale_factor = exp(mix(ln_min, ln_max, t));
 
@@ -416,11 +416,10 @@ kernel void instantNGPRender(
     }
 
     const uint2 pixel = gid;
-    const float2 pixel_center = (float2(pixel) + 0.5f);
     const float texture_width_f = float(texture_width);
     const float texture_height_f = float(texture_height);
 
-    float2 uv = pixel_center / float2(texture_width_f - 1.0, texture_height_f - 1.0);
+    float2 uv = float2(float(pixel.x), float(pixel.y)) / float2(texture_width_f - 1.0, texture_height_f - 1.0);
 
     if (uniforms.trainingWidth > 0 && uniforms.trainingHeight > 0) {
         const float target_aspect = float(uniforms.trainingWidth) / float(uniforms.trainingHeight);

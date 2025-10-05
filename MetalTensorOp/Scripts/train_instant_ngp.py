@@ -38,9 +38,15 @@ class HashEncoder(nn.Module):
         self.hashmap_size = 2 ** LOG2_HASHMAP_SIZE
         self.dim = 2  # 2D for images
 
-        self.level_scales = mx.exp(
-            mx.linspace(mx.log(BASE_RESOLUTION), mx.log(MAX_RESOLUTION), NUM_LEVELS)
+        scale_values = np.exp(
+            np.linspace(
+                np.floor(np.log(BASE_RESOLUTION)),
+                np.floor(np.log(MAX_RESOLUTION)),
+                NUM_LEVELS,
+                dtype=np.float32,
+            )
         )
+        self.level_scales = mx.array(scale_values, dtype=mx.float32)
 
         # Create embedding tables for each resolution level
         self.embeddings = [
