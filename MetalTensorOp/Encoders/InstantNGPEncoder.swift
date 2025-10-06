@@ -20,8 +20,6 @@ struct InstantNGPConfig {
 
     static let mlpHiddenWidth = 64
     static let mlpOutputDim = 3
-    static let mlpNumLayers = 2
-
     static let batchSize = 64
 }
 

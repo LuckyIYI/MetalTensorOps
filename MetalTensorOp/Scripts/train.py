@@ -382,6 +382,7 @@ def train_siren(
     max_dim: int,
     sample_count: int,
     sample_seed: int,
+    batch_size: int | None,
 ):
     print("Training SIREN (MLX)")
     positions, colors, width, height = sample_image(image_path, max_dim=max_dim, space="minus_one_one")
@@ -398,7 +399,7 @@ def train_siren(
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
-    batch_size = min(99999, positions.shape[0])
+    batch_size = min(batch_size or positions.shape[0], positions.shape[0])
     num_samples = positions.shape[0]
 
     for it in range(1, steps + 1):
@@ -456,6 +457,7 @@ def train_fourier(
     max_dim: int,
     sample_count: int,
     sample_seed: int,
+    batch_size: int | None,
 ):
     print("Training Fourier MLP (MLX)")
     positions, colors, width, height = sample_image(image_path, max_dim=max_dim, space="minus_one_one")
@@ -472,7 +474,7 @@ def train_fourier(
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
-    batch_size = min(99999, positions.shape[0])
+    batch_size = min(batch_size or positions.shape[0], positions.shape[0])
     num_samples = positions.shape[0]
 
     for it in range(1, steps + 1):
@@ -614,6 +616,7 @@ def main():
     ap.add_argument('--sigma', type=float, default=1.0, help='Sigma for Fourier features (default: 1.0)')
     ap.add_argument('--sample-count', type=int, default=256, help='Number of embedded samples (default: 256)')
     ap.add_argument('--sample-seed', type=int, default=1337, help='Sample selection seed (default: 1337)')
+    ap.add_argument('--batch-size', type=int, help='Override training batch size (default: full batch)')
     args = ap.parse_args()
 
     image_path = Path(args.image)
@@ -658,6 +661,7 @@ def main():
             max_dim=args.max_dim,
             sample_count=args.sample_count,
             sample_seed=args.sample_seed,
+            batch_size=args.batch_size,
         )
     elif args.model == 'fourier':
         train_fourier(
@@ -672,6 +676,7 @@ def main():
             max_dim=args.max_dim,
             sample_count=args.sample_count,
             sample_seed=args.sample_seed,
+            batch_size=args.batch_size,
         )
 
 

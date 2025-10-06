@@ -31,8 +31,6 @@ struct InstantNGPRenderUniforms {
 // MLP configuration for cooperative execution
 #define NGP_MLP_HIDDEN_WIDTH 64
 #define NGP_MLP_OUTPUT_DIM 3  // RGB output
-#define NGP_MLP_NUM_LAYERS 2
-
 #define NGP_BATCH_SIZE 64  // Process 64 positions per threadgroup
 
 // Hash function: 2D spatial hash matching MLX implementation
