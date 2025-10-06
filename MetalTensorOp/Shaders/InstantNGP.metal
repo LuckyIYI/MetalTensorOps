@@ -2,6 +2,7 @@
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_numeric>
+#include "MLPCommon.metal"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -111,211 +112,70 @@ inline void compute_full_hash_encoding_2d(
     }
 }
 
-// Cooperative Instant NGP Inference Kernel
-// Processes a batch of positions using cooperative matmul
-kernel void instantNGPInference(
-    tensor<device half, dextents<int, 2>> layer1_weights [[buffer(0)]],  // (features, hidden)
-    tensor<device half, dextents<int, 1>> layer1_bias [[buffer(1)]],     // (hidden)
-    tensor<device half, dextents<int, 2>> layer2_weights [[buffer(2)]],  // (hidden, output)
-    tensor<device half, dextents<int, 1>> layer2_bias [[buffer(3)]],     // (output)
-    device half *hash_table [[buffer(4)]],         // Multi-resolution hash table
-    tensor<device float, dextents<int, 2>> positions [[buffer(5)]],  // Input positions (N, 2)
-    tensor<device half, dextents<int, 2>> outputs [[buffer(6)]],     // Output RGB (N, 3)
-    constant uint &num_positions [[buffer(7)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]]
-) {
-    constexpr uint THREADS_PER_SIMDGROUP = 32u;
-    constexpr uint SIMDGROUPS_PER_THREADGROUP = 4u;
-    constexpr uint THREADGROUP_SIZE = THREADS_PER_SIMDGROUP * SIMDGROUPS_PER_THREADGROUP;
-
-    const uint batch_start = tgid.y * NGP_BATCH_SIZE;
-    if (batch_start >= num_positions) {
+template<typename LoadPosition, typename StoreOutput>
+inline void instantNGPRunCooperativeBatch(
+    constant DeviceMLPLayers &mlpLayers,
+    constant uint &mlpLayerCount,
+    device half *hashTable,
+    LoadPosition loadPosition,
+    StoreOutput storeOutput,
+    uint batchStart,
+    uint actualBatch,
+    uint linearThreadId,
+    uint threadgroupSize,
+    threadgroup half *encodedStorage,
+    threadgroup float *hiddenAccumStorage,
+    threadgroup half *hiddenStorage,
+    threadgroup float *outputAccumStorage,
+    threadgroup half *outputStorage,
+    threadgroup uchar *sampleMask
+)
+{
+    if (mlpLayerCount == 0) {
         return;
     }
 
-    const uint remaining = num_positions - batch_start;
-    const uint actual_batch = remaining < NGP_BATCH_SIZE ? remaining : uint(NGP_BATCH_SIZE);
-
-    threadgroup half encoded_storage[NGP_BATCH_SIZE * NGP_TOTAL_FEATURES];
-    threadgroup float hidden_accum_storage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
-    threadgroup half hidden_storage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
-    threadgroup float output_accum_storage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
-    threadgroup half output_storage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
-
-    const uint linear_thread_id = simd_group_id * THREADS_PER_SIMDGROUP + simd_lane_id;
-
-    for (uint idx = linear_thread_id; idx < NGP_BATCH_SIZE * NGP_TOTAL_FEATURES; idx += THREADGROUP_SIZE) {
-        encoded_storage[idx] = half(0.0f);
+    for (uint idx = linearThreadId; idx < NGP_BATCH_SIZE * NGP_TOTAL_FEATURES; idx += threadgroupSize) {
+        encodedStorage[idx] = half(0.0f);
     }
-    for (uint idx = linear_thread_id; idx < NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH; idx += THREADGROUP_SIZE) {
-        hidden_accum_storage[idx] = 0.0f;
-        hidden_storage[idx] = half(0.0f);
+    for (uint idx = linearThreadId; idx < NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH; idx += threadgroupSize) {
+        hiddenAccumStorage[idx] = 0.0f;
+        hiddenStorage[idx] = half(0.0f);
     }
-    for (uint idx = linear_thread_id; idx < NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM; idx += THREADGROUP_SIZE) {
-        output_accum_storage[idx] = 0.0f;
-        output_storage[idx] = half(0.0f);
+    for (uint idx = linearThreadId; idx < NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM; idx += threadgroupSize) {
+        outputAccumStorage[idx] = 0.0f;
+        outputStorage[idx] = half(0.0f);
+    }
+    for (uint idx = linearThreadId; idx < NGP_BATCH_SIZE; idx += threadgroupSize) {
+        sampleMask[idx] = 0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint local_idx = linear_thread_id; local_idx < actual_batch; local_idx += THREADGROUP_SIZE) {
-        const uint position_index = batch_start + local_idx;
-        const float2 position = float2(
-            positions[position_index, 0],
-            positions[position_index, 1]
-        );
+    for (uint localIdx = linearThreadId; localIdx < actualBatch; localIdx += threadgroupSize) {
+        const uint sampleIndex = batchStart + localIdx;
+        thread float2 position;
+        const bool active = loadPosition(sampleIndex, position);
+        sampleMask[localIdx] = active ? 1 : 0;
+        if (!active) {
+            continue;
+        }
 
-        thread float encoded_features[NGP_TOTAL_FEATURES];
-        compute_full_hash_encoding_2d(position, hash_table, encoded_features);
+        thread float encodedFeatures[NGP_TOTAL_FEATURES];
+        compute_full_hash_encoding_2d(position, hashTable, encodedFeatures);
 
         #pragma unroll
         for (uint f = 0; f < NGP_TOTAL_FEATURES; ++f) {
-            encoded_storage[local_idx * NGP_TOTAL_FEATURES + f] = half(encoded_features[f]);
+            encodedStorage[localIdx * NGP_TOTAL_FEATURES + f] = half(encodedFeatures[f]);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    auto encoded_tensor = tensor(encoded_storage, dextents<int, 2>(NGP_TOTAL_FEATURES, NGP_BATCH_SIZE));
-    auto hidden_accum_tensor = tensor(hidden_accum_storage, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, NGP_BATCH_SIZE));
-    auto hidden_tensor = tensor(hidden_storage, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, NGP_BATCH_SIZE));
-    auto output_accum_tensor = tensor(output_accum_storage, dextents<int, 2>(NGP_MLP_OUTPUT_DIM, NGP_BATCH_SIZE));
+    auto encodedTensor = tensor(encodedStorage, dextents<int, 2>(NGP_TOTAL_FEATURES, NGP_BATCH_SIZE));
+    auto hiddenAccumTensor = tensor(hiddenAccumStorage, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, NGP_BATCH_SIZE));
+    auto hiddenTensor = tensor(hiddenStorage, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, NGP_BATCH_SIZE));
+    auto outputAccumTensor = tensor(outputAccumStorage, dextents<int, 2>(NGP_MLP_OUTPUT_DIM, NGP_BATCH_SIZE));
 
-    // Use consistent layout: C(N, M) = B(N, K) * A(K, M)
-    // A = encoded(K, batch), B1 = W1(N, K), B2 = W2(N, K)
-    constexpr auto layer1_descriptor = matmul2d_descriptor(
-        NGP_BATCH_SIZE,            // M (batch)
-        NGP_MLP_HIDDEN_WIDTH,      // N (hidden)
-        dynamic_length_v<int>,     // K (features)
-        false,                     // transpose A
-        false,                     // transpose B
-        false,
-        matmul2d_descriptor::mode::multiply
-    );
-
-    constexpr auto layer2_descriptor = matmul2d_descriptor(
-        NGP_BATCH_SIZE,            // M (batch)
-        NGP_MLP_OUTPUT_DIM,        // N (output)
-        dynamic_length_v<int>,     // K (hidden)
-        false,
-        false,
-        false,
-        matmul2d_descriptor::mode::multiply
-    );
-
-    matmul2d<layer1_descriptor, execution_simdgroups<4>> layer1_matmul;
-    matmul2d<layer2_descriptor, execution_simdgroups<4>> layer2_matmul;
-
-    layer1_matmul.run(encoded_tensor, layer1_weights, hidden_accum_tensor);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint idx = linear_thread_id; idx < actual_batch * NGP_MLP_HIDDEN_WIDTH; idx += THREADGROUP_SIZE) {
-        const uint batch_idx = idx / NGP_MLP_HIDDEN_WIDTH;
-        const uint hidden_idx = idx % NGP_MLP_HIDDEN_WIDTH;
-        float value = hidden_accum_storage[hidden_idx + batch_idx * NGP_MLP_HIDDEN_WIDTH] + float(layer1_bias[hidden_idx]);
-        value = max(value, 0.0f);
-        hidden_storage[hidden_idx + batch_idx * NGP_MLP_HIDDEN_WIDTH] = half(value);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    layer2_matmul.run(hidden_tensor, layer2_weights, output_accum_tensor);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint idx = linear_thread_id; idx < actual_batch * NGP_MLP_OUTPUT_DIM; idx += THREADGROUP_SIZE) {
-        const uint batch_idx = idx / NGP_MLP_OUTPUT_DIM;
-        const uint output_idx = idx % NGP_MLP_OUTPUT_DIM;
-        float value = output_accum_storage[output_idx + batch_idx * NGP_MLP_OUTPUT_DIM] + float(layer2_bias[output_idx]);
-        float sigmoid = 1.f / (1.f + exp(-value));
-        output_storage[output_idx + batch_idx * NGP_MLP_OUTPUT_DIM] = half(sigmoid);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint idx = linear_thread_id; idx < actual_batch * NGP_MLP_OUTPUT_DIM; idx += THREADGROUP_SIZE) {
-        const uint batch_idx = idx / NGP_MLP_OUTPUT_DIM;
-        const uint output_idx = idx % NGP_MLP_OUTPUT_DIM;
-        const uint position_index = batch_start + batch_idx;
-        outputs[position_index, output_idx] = output_storage[output_idx + batch_idx * NGP_MLP_OUTPUT_DIM];
-    }
-}
-
-
-// Debug variant: dumps per-stage activations for comparison against MLX
-kernel void instantNGPInferenceDebug(
-    tensor<device half, dextents<int, 2>> layer1_weights [[buffer(0)]],  // (hidden, features)
-    tensor<device half, dextents<int, 1>> layer1_bias [[buffer(1)]],     // (hidden)
-    tensor<device half, dextents<int, 2>> layer2_weights [[buffer(2)]],  // (output, hidden)
-    tensor<device half, dextents<int, 1>> layer2_bias [[buffer(3)]],     // (output)
-    device half *hash_table [[buffer(4)]],
-    tensor<device float, dextents<int, 2>> positions [[buffer(5)]],      // (N, 2)
-    tensor<device half, dextents<int, 2>> outputs [[buffer(6)]],         // (N, 3)
-    constant uint &num_positions [[buffer(7)]],
-    tensor<device float, dextents<int, 2>> debug_encoded [[buffer(8)]],  // (N, NGP_TOTAL_FEATURES)
-    tensor<device float, dextents<int, 2>> debug_hidden [[buffer(9)]],   // (N, NGP_MLP_HIDDEN_WIDTH)
-    tensor<device float, dextents<int, 2>> debug_output [[buffer(10)]],  // (N, NGP_MLP_OUTPUT_DIM)
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]]
-) {
-    constexpr uint THREADS_PER_SIMDGROUP = 32u;
-    constexpr uint SIMDGROUPS_PER_THREADGROUP = 4u;
-    constexpr uint THREADGROUP_SIZE = THREADS_PER_SIMDGROUP * SIMDGROUPS_PER_THREADGROUP;
-
-    const uint batch_start = tgid.y * NGP_BATCH_SIZE;
-    if (batch_start >= num_positions) {
-        return;
-    }
-
-    const uint remaining = num_positions - batch_start;
-    const uint actual_batch = remaining < NGP_BATCH_SIZE ? remaining : uint(NGP_BATCH_SIZE);
-
-    threadgroup half encoded_storage[NGP_BATCH_SIZE * NGP_TOTAL_FEATURES];
-    threadgroup float hidden_accum_storage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
-    threadgroup half hidden_storage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
-    threadgroup float output_accum_storage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
-    threadgroup half output_storage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
-
-    const uint linear_thread_id = simd_group_id * THREADS_PER_SIMDGROUP + simd_lane_id;
-
-    for (uint idx = linear_thread_id; idx < NGP_BATCH_SIZE * NGP_TOTAL_FEATURES; idx += THREADGROUP_SIZE) {
-        encoded_storage[idx] = half(0.0f);
-    }
-    for (uint idx = linear_thread_id; idx < NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH; idx += THREADGROUP_SIZE) {
-        hidden_accum_storage[idx] = 0.0f;
-        hidden_storage[idx] = half(0.0f);
-    }
-    for (uint idx = linear_thread_id; idx < NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM; idx += THREADGROUP_SIZE) {
-        output_accum_storage[idx] = 0.0f;
-        output_storage[idx] = half(0.0f);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 1) Hash encoding per sample
-    for (uint local_idx = linear_thread_id; local_idx < actual_batch; local_idx += THREADGROUP_SIZE) {
-        const uint position_index = batch_start + local_idx;
-        const float2 position = float2(
-            positions[position_index, 0],
-            positions[position_index, 1]
-        );
-
-        thread float encoded_features[NGP_TOTAL_FEATURES];
-        compute_full_hash_encoding_2d(position, hash_table, encoded_features);
-
-        #pragma unroll
-        for (uint f = 0; f < NGP_TOTAL_FEATURES; ++f) {
-            encoded_storage[local_idx * NGP_TOTAL_FEATURES + f] = half(encoded_features[f]);
-            // Dump encoded features in column-major: (N, F)
-            debug_encoded[position_index, f] = encoded_features[f];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    auto encoded_tensor = tensor(encoded_storage, dextents<int, 2>(NGP_TOTAL_FEATURES, NGP_BATCH_SIZE));
-    auto hidden_accum_tensor = tensor(hidden_accum_storage, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, NGP_BATCH_SIZE));
-    auto hidden_tensor = tensor(hidden_storage, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, NGP_BATCH_SIZE));
-    auto output_accum_tensor = tensor(output_accum_storage, dextents<int, 2>(NGP_MLP_OUTPUT_DIM, NGP_BATCH_SIZE));
-
-    // Use consistent layout: C(N, M) = B(N, K) * A(K, M)
-    constexpr auto layer1_descriptor = matmul2d_descriptor(
+    constexpr auto firstLayerDescriptor = matmul2d_descriptor(
         NGP_BATCH_SIZE,
         NGP_MLP_HIDDEN_WIDTH,
         dynamic_length_v<int>,
@@ -325,7 +185,17 @@ kernel void instantNGPInferenceDebug(
         matmul2d_descriptor::mode::multiply
     );
 
-    constexpr auto layer2_descriptor = matmul2d_descriptor(
+    constexpr auto hiddenLayerDescriptor = matmul2d_descriptor(
+        NGP_BATCH_SIZE,
+        NGP_MLP_HIDDEN_WIDTH,
+        dynamic_length_v<int>,
+        false,
+        false,
+        false,
+        matmul2d_descriptor::mode::multiply
+    );
+
+    constexpr auto outputLayerDescriptor = matmul2d_descriptor(
         NGP_BATCH_SIZE,
         NGP_MLP_OUTPUT_DIM,
         dynamic_length_v<int>,
@@ -335,81 +205,213 @@ kernel void instantNGPInferenceDebug(
         matmul2d_descriptor::mode::multiply
     );
 
-    // 2) Layer 1 matmul
-    matmul2d<layer1_descriptor, execution_simdgroups<4>> layer1_matmul;
-    matmul2d<layer2_descriptor, execution_simdgroups<4>> layer2_matmul;
-    layer1_matmul.run(encoded_tensor, layer1_weights, hidden_accum_tensor);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    matmul2d<firstLayerDescriptor, execution_simdgroups<4>> firstLayerMatmul;
+    matmul2d<hiddenLayerDescriptor, execution_simdgroups<4>> hiddenLayerMatmul;
+    matmul2d<outputLayerDescriptor, execution_simdgroups<4>> outputLayerMatmul;
 
-    // Bias + ReLU and dump hidden activations
-    for (uint idx = linear_thread_id; idx < actual_batch * NGP_MLP_HIDDEN_WIDTH; idx += THREADGROUP_SIZE) {
-        const uint batch_idx = idx / NGP_MLP_HIDDEN_WIDTH;
-        const uint hidden_idx = idx % NGP_MLP_HIDDEN_WIDTH;
-        float value = hidden_accum_storage[hidden_idx + batch_idx * NGP_MLP_HIDDEN_WIDTH] + float(layer1_bias[hidden_idx]);
-        value = max(value, 0.0f);
-        hidden_storage[hidden_idx + batch_idx * NGP_MLP_HIDDEN_WIDTH] = half(value);
-        const uint position_index = batch_start + batch_idx;
-        debug_hidden[position_index, hidden_idx] = value;
+    for (uint layerIndex = 0; layerIndex < mlpLayerCount; ++layerIndex) {
+        auto weights = mlpLayers.weights[layerIndex];
+        auto biases = mlpLayers.biases[layerIndex];
+        const bool isFirstLayer = (layerIndex == 0);
+        const bool isLastLayer = (layerIndex == mlpLayerCount - 1);
+
+        if (isFirstLayer) {
+            firstLayerMatmul.run(encodedTensor, weights, hiddenAccumTensor);
+        } else if (isLastLayer) {
+            outputLayerMatmul.run(hiddenTensor, weights, outputAccumTensor);
+        } else {
+            hiddenLayerMatmul.run(hiddenTensor, weights, hiddenAccumTensor);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (isLastLayer) {
+            for (uint idx = linearThreadId; idx < actualBatch * NGP_MLP_OUTPUT_DIM; idx += threadgroupSize) {
+                const uint batchIdx = idx / NGP_MLP_OUTPUT_DIM;
+                if (!sampleMask[batchIdx]) {
+                    continue;
+                }
+                const uint outputIdx = idx % NGP_MLP_OUTPUT_DIM;
+                float value = outputAccumStorage[outputIdx + batchIdx * NGP_MLP_OUTPUT_DIM] + float(biases[outputIdx]);
+                outputStorage[outputIdx + batchIdx * NGP_MLP_OUTPUT_DIM] = half(activation_sigmoid(value));
+            }
+        } else {
+            for (uint idx = linearThreadId; idx < actualBatch * NGP_MLP_HIDDEN_WIDTH; idx += threadgroupSize) {
+                const uint batchIdx = idx / NGP_MLP_HIDDEN_WIDTH;
+                if (!sampleMask[batchIdx]) {
+                    continue;
+                }
+                const uint hiddenIdx = idx % NGP_MLP_HIDDEN_WIDTH;
+                float value = hiddenAccumStorage[hiddenIdx + batchIdx * NGP_MLP_HIDDEN_WIDTH] + float(biases[hiddenIdx]);
+                hiddenStorage[hiddenIdx + batchIdx * NGP_MLP_HIDDEN_WIDTH] = half(activation_relu(value));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint localIdx = linearThreadId; localIdx < actualBatch; localIdx += threadgroupSize) {
+        if (!sampleMask[localIdx]) {
+            continue;
+        }
+        const uint sampleIndex = batchStart + localIdx;
+        storeOutput(sampleIndex, localIdx, outputStorage);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 3) Layer 2 matmul
-    layer2_matmul.run(hidden_tensor, layer2_weights, output_accum_tensor);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Bias + sigmoid and dump outputs
-    for (uint idx = linear_thread_id; idx < actual_batch * NGP_MLP_OUTPUT_DIM; idx += THREADGROUP_SIZE) {
-        const uint batch_idx = idx / NGP_MLP_OUTPUT_DIM;
-        const uint output_idx = idx % NGP_MLP_OUTPUT_DIM;
-        float value = output_accum_storage[output_idx + batch_idx * NGP_MLP_OUTPUT_DIM] + float(layer2_bias[output_idx]);
-        float sigmoid = 1.f / (1.f + exp(-value));
-        output_storage[output_idx + batch_idx * NGP_MLP_OUTPUT_DIM] = half(sigmoid);
-        const uint position_index = batch_start + batch_idx;
-        debug_output[position_index, output_idx] = sigmoid;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Write final outputs (half) for completeness
-    for (uint idx = linear_thread_id; idx < actual_batch * NGP_MLP_OUTPUT_DIM; idx += THREADGROUP_SIZE) {
-        const uint batch_idx = idx / NGP_MLP_OUTPUT_DIM;
-        const uint output_idx = idx % NGP_MLP_OUTPUT_DIM;
-        const uint position_index = batch_start + batch_idx;
-        outputs[position_index, output_idx] = output_storage[output_idx + batch_idx * NGP_MLP_OUTPUT_DIM];
-    }
 }
 
-kernel void instantNGPEncodeDebug(
-    device half *hash_table [[buffer(0)]],
-    tensor<device float, dextents<int, 2>> positions [[buffer(1)]],
-    tensor<device float, dextents<int, 2>> encodings [[buffer(2)]],
-    constant uint &num_positions [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= num_positions) {
+struct InstantNGPBufferPositionLoader {
+    tensor<device float, dextents<int, 2>> positions;
+
+    inline bool operator()(uint sampleIndex, thread float2 &position) const {
+        position = float2(positions[sampleIndex, 0], positions[sampleIndex, 1]);
+        return true;
+    }
+};
+
+struct InstantNGPBufferOutputWriter {
+    tensor<device half, dextents<int, 2>> outputs;
+
+    inline void operator()(uint sampleIndex, uint localIdx, threadgroup half *outputStorage) const {
+        for (uint channel = 0; channel < NGP_MLP_OUTPUT_DIM; ++channel) {
+            outputs[sampleIndex, channel] = outputStorage[localIdx * NGP_MLP_OUTPUT_DIM + channel];
+        }
+    }
+};
+
+struct InstantNGPTexturePositionLoader {
+    uint textureWidth;
+    uint textureHeight;
+    uint trainingWidth;
+    uint trainingHeight;
+
+    inline bool operator()(uint sampleIndex, thread float2 &uv) const {
+        const uint x = sampleIndex % textureWidth;
+        const uint y = sampleIndex / textureWidth;
+        if (x >= textureWidth || y >= textureHeight) {
+            uv = float2(0.0f);
+            return false;
+        }
+
+        const float denomX = (textureWidth > 1u) ? float(textureWidth - 1u) : 1.0f;
+        const float denomY = (textureHeight > 1u) ? float(textureHeight - 1u) : 1.0f;
+        uv = float2(float(x), float(y)) / float2(denomX, denomY);
+
+        if (trainingWidth > 0u && trainingHeight > 0u) {
+            const float targetAspect = float(trainingWidth) / float(trainingHeight);
+            const float textureAspect = float(textureWidth) / float(textureHeight);
+
+            if (textureAspect > targetAspect) {
+                const float visible = targetAspect / textureAspect;
+                const float left = 0.5f - 0.5f * visible;
+                uv.x = (uv.x - left) / visible;
+            } else if (textureAspect < targetAspect) {
+                const float visible = textureAspect / targetAspect;
+                const float top = 0.5f - 0.5f * visible;
+                uv.y = (uv.y - top) / visible;
+            }
+        }
+
+        if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+            return false;
+        }
+
+        return true;
+    }
+};
+
+struct InstantNGPTextureOutputWriter {
+    texture2d<float, access::write> outTexture;
+    uint textureWidth;
+    uint textureHeight;
+
+    inline void operator()(uint sampleIndex, uint localIdx, threadgroup half *outputStorage) const {
+        const uint x = sampleIndex % textureWidth;
+        const uint y = sampleIndex / textureWidth;
+        if (x >= textureWidth || y >= textureHeight) {
+            return;
+        }
+        float3 rgb;
+        rgb.x = float(outputStorage[localIdx * NGP_MLP_OUTPUT_DIM + 0]);
+        rgb.y = float(outputStorage[localIdx * NGP_MLP_OUTPUT_DIM + 1]);
+        rgb.z = float(outputStorage[localIdx * NGP_MLP_OUTPUT_DIM + 2]);
+        outTexture.write(float4(rgb, 1.0f), uint2(x, y));
+    }
+};
+
+// Cooperative Instant NGP inference that writes into a buffer
+// Processes a batch of positions using cooperative matmul
+kernel void instantNGPCoopBuffer(
+    constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
+    constant uint &mlpLayerCount [[buffer(1)]],
+    device half *hashTable [[buffer(2)]],
+    tensor<device float, dextents<int, 2>> positions [[buffer(3)]],
+    tensor<device half, dextents<int, 2>> outputs [[buffer(4)]],
+    constant uint &numPositions [[buffer(5)]],
+    uint3 threadgroupPositionInGrid [[threadgroup_position_in_grid]],
+    ushort threadsPerSimdgroup [[threads_per_simdgroup]],
+    ushort3 threadsPerThreadgroup [[threads_per_threadgroup]],
+    ushort simdLaneId [[thread_index_in_simdgroup]],
+    ushort simdGroupId [[simdgroup_index_in_threadgroup]]
+) {
+    const uint threadgroupSize =
+        uint(threadsPerThreadgroup.x) * uint(threadsPerThreadgroup.y) * uint(threadsPerThreadgroup.z);
+    const uint linearThreadId = uint(simdGroupId) * uint(threadsPerSimdgroup) + uint(simdLaneId);
+
+    const uint batchStart = threadgroupPositionInGrid.y * NGP_BATCH_SIZE;
+    if (batchStart >= numPositions) {
         return;
     }
 
-    const float2 position = float2(positions[gid, 0], positions[gid, 1]);
-    thread float encoded_features[NGP_TOTAL_FEATURES];
-    compute_full_hash_encoding_2d(position, hash_table, encoded_features);
+    const uint remaining = numPositions - batchStart;
+    const uint actualBatch = remaining < NGP_BATCH_SIZE ? remaining : (uint)NGP_BATCH_SIZE;
 
-    for (uint f = 0; f < NGP_TOTAL_FEATURES; ++f) {
-        encodings[gid, f] = encoded_features[f];
-    }
+    threadgroup half encodedStorage[NGP_BATCH_SIZE * NGP_TOTAL_FEATURES];
+    threadgroup float hiddenAccumStorage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
+    threadgroup half hiddenStorage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
+    threadgroup float outputAccumStorage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
+    threadgroup half outputStorage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
+    threadgroup uchar sampleMask[NGP_BATCH_SIZE];
+
+    InstantNGPBufferPositionLoader loader{positions};
+    InstantNGPBufferOutputWriter writer{outputs};
+
+    instantNGPRunCooperativeBatch(
+        mlpLayers,
+        mlpLayerCount,
+        hashTable,
+        loader,
+        writer,
+        batchStart,
+        actualBatch,
+        linearThreadId,
+        threadgroupSize,
+        encodedStorage,
+        hiddenAccumStorage,
+        hiddenStorage,
+        outputAccumStorage,
+        outputStorage,
+        sampleMask
+    );
 }
+
 
 kernel void instantNGPRender(
     texture2d<float, access::write> outTexture [[texture(0)]],
-    tensor<device half, dextents<int, 2>> layer1_weights [[buffer(0)]],
-    tensor<device half, dextents<int, 1>> layer1_bias [[buffer(1)]],
-    tensor<device half, dextents<int, 2>> layer2_weights [[buffer(2)]],
-    tensor<device half, dextents<int, 1>> layer2_bias [[buffer(3)]],
-    device half *hash_table [[buffer(4)]],
-    constant InstantNGPRenderUniforms &uniforms [[buffer(5)]],
+    constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
+    constant uint &mlpLayerCount [[buffer(1)]],
+    device half *hash_table [[buffer(2)]],
+    constant InstantNGPRenderUniforms &uniforms [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]])
 {
+    if (mlpLayerCount == 0) {
+        return;
+    }
+
     const uint texture_width = outTexture.get_width();
     const uint texture_height = outTexture.get_height();
+    const float texture_width_coop = float(texture_width);
+    const float texture_height_coop = float(texture_height);
+    const float denom_x = (texture_width > 1) ? float(texture_width - 1) : 1.0f;
+    const float denom_y = (texture_height > 1) ? float(texture_height - 1) : 1.0f;
 
     if (gid.x >= texture_width || gid.y >= texture_height) {
         return;
@@ -450,10 +452,15 @@ kernel void instantNGPRender(
     }
     auto encoded_tensor = tensor(encoded_features, dextents<int, 2>(NGP_TOTAL_FEATURES, 1));
 
-    thread half hidden_matmul[NGP_MLP_HIDDEN_WIDTH];
-    auto hidden_tensor = tensor(hidden_matmul, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+    thread half hidden_activation[NGP_MLP_HIDDEN_WIDTH];
+    thread half next_activation[NGP_MLP_HIDDEN_WIDTH];
+    auto hidden_tensor = tensor(hidden_activation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+    auto next_tensor = tensor(next_activation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
 
-    constexpr auto layer1_desc = matmul2d_descriptor(
+    thread half output_activation[NGP_MLP_OUTPUT_DIM];
+    auto output_tensor = tensor(output_activation, dextents<int, 2>(NGP_MLP_OUTPUT_DIM, 1));
+
+    constexpr auto first_layer_desc = matmul2d_descriptor(
         1,
         NGP_MLP_HIDDEN_WIDTH,
         NGP_TOTAL_FEATURES,
@@ -463,19 +470,17 @@ kernel void instantNGPRender(
         matmul2d_descriptor::mode::multiply
     );
 
-    matmul2d<layer1_desc, execution_thread> layer1_matmul;
-    layer1_matmul.run(encoded_tensor, layer1_weights, hidden_tensor);
+    constexpr auto hidden_layer_desc = matmul2d_descriptor(
+        1,
+        NGP_MLP_HIDDEN_WIDTH,
+        NGP_MLP_HIDDEN_WIDTH,
+        false,
+        false,
+        false,
+        matmul2d_descriptor::mode::multiply
+    );
 
-    for (uint hidden_idx = 0; hidden_idx < NGP_MLP_HIDDEN_WIDTH; ++hidden_idx) {
-        float value = float(hidden_tensor[hidden_idx, 0]) + float(layer1_bias[hidden_idx]);
-        value = max(value, 0.0f);
-        hidden_tensor[hidden_idx, 0] = half(value);
-    }
-
-    thread half output_matmul[NGP_MLP_OUTPUT_DIM];
-    auto output_tensor = tensor(output_matmul, dextents<int, 2>(NGP_MLP_OUTPUT_DIM, 1));
-
-    constexpr auto layer2_desc = matmul2d_descriptor(
+    constexpr auto output_layer_desc = matmul2d_descriptor(
         1,
         NGP_MLP_OUTPUT_DIM,
         NGP_MLP_HIDDEN_WIDTH,
@@ -485,36 +490,110 @@ kernel void instantNGPRender(
         matmul2d_descriptor::mode::multiply
     );
 
-    matmul2d<layer2_desc, execution_thread> layer2_matmul;
-    layer2_matmul.run(hidden_tensor, layer2_weights, output_tensor);
+    matmul2d<first_layer_desc, execution_thread> first_layer_matmul;
+    matmul2d<hidden_layer_desc, execution_thread> hidden_layer_matmul;
+    matmul2d<output_layer_desc, execution_thread> output_layer_matmul;
+
+    auto firstLayerWeights = mlpLayers.weights[0];
+    auto firstLayerBias = mlpLayers.biases[0];
+    first_layer_matmul.run(encoded_tensor, firstLayerWeights, hidden_tensor);
+    for (uint i = 0; i < NGP_MLP_HIDDEN_WIDTH; ++i) {
+        float value = float(hidden_tensor[i, 0]) + float(firstLayerBias[i]);
+        hidden_activation[i] = half(activation_relu(value));
+    }
+
+    thread half *currentActivation = hidden_activation;
+    thread half *nextActivation = next_activation;
+
+    for (uint layerIndex = 1; layerIndex + 1 < mlpLayerCount; ++layerIndex) {
+        auto input_tensor = tensor(currentActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+        auto output_temp_tensor = tensor(nextActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+        auto weights = mlpLayers.weights[layerIndex];
+        auto biases = mlpLayers.biases[layerIndex];
+        hidden_layer_matmul.run(input_tensor, weights, output_temp_tensor);
+        for (uint i = 0; i < NGP_MLP_HIDDEN_WIDTH; ++i) {
+            float value = float(output_temp_tensor[i, 0]) + float(biases[i]);
+            nextActivation[i] = half(activation_relu(value));
+        }
+        thread half *temp = currentActivation;
+        currentActivation = nextActivation;
+        nextActivation = temp;
+    }
+
+    auto final_input_tensor = tensor(currentActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+    const uint lastLayerIndex = mlpLayerCount - 1;
+    auto outputWeights = mlpLayers.weights[lastLayerIndex];
+    auto outputBias = mlpLayers.biases[lastLayerIndex];
+    output_layer_matmul.run(final_input_tensor, outputWeights, output_tensor);
 
     float3 rgb;
     for (uint channel = 0; channel < NGP_MLP_OUTPUT_DIM; ++channel) {
-        float value = float(output_tensor[channel, 0]) + float(layer2_bias[channel]);
-        rgb[channel] = 1.f / (1.f + exp(-value));
+        float value = float(output_tensor[channel, 0]) + float(outputBias[channel]);
+        rgb[channel] = activation_sigmoid(value);
     }
 
     outTexture.write(float4(rgb, 1.0f), pixel);
 }
 
-kernel void instantNGPTrainStep(
-    tensor<device half, dextents<int, 2>> layer1_weights [[buffer(0)]],
-    tensor<device half, dextents<int, 1>> layer1_bias [[buffer(1)]],
-    tensor<device half, dextents<int, 2>> layer2_weights [[buffer(2)]],
-    tensor<device half, dextents<int, 1>> layer2_bias [[buffer(3)]],
-    device half *hash_table [[buffer(4)]],
-    device float3 *positions [[buffer(5)]],
-    device half3 *target_colors [[buffer(6)]],
-    device half *hash_gradients [[buffer(7)]],
-    device half *weight_gradients [[buffer(8)]],
-    constant uint &batch_size [[buffer(9)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    // Forward pass + backward pass implementation
-    // Left as exercise - would implement:
-    // 1. Forward pass to compute outputs
-    // 2. Compute loss (MSE or similar)
-    // 3. Backward pass through MLP
-    // 4. Backward pass through hash encoding
-    // 5. Accumulate gradients
+kernel void instantNGPRenderCoop(
+    texture2d<float, access::write> outTexture [[texture(0)]],
+    constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
+    constant uint &mlpLayerCount [[buffer(1)]],
+    device half *hashTable [[buffer(2)]],
+    constant InstantNGPRenderUniforms &uniforms [[buffer(3)]],
+    constant uint &numPixels [[buffer(4)]],
+    uint3 threadgroupPositionInGrid [[threadgroup_position_in_grid]],
+    ushort threadsPerSimdgroup [[threads_per_simdgroup]],
+    ushort3 threadsPerThreadgroup [[threads_per_threadgroup]],
+    ushort simdLaneId [[thread_index_in_simdgroup]],
+    ushort simdGroupId [[simdgroup_index_in_threadgroup]]
+)
+{
+    const uint threadgroupSize =
+        uint(threadsPerThreadgroup.x) * uint(threadsPerThreadgroup.y) * uint(threadsPerThreadgroup.z);
+    const uint linearThreadId = uint(simdGroupId) * uint(threadsPerSimdgroup) + uint(simdLaneId);
+
+    const uint textureWidth = outTexture.get_width();
+    const uint textureHeight = outTexture.get_height();
+
+    const uint batchStart = threadgroupPositionInGrid.x * NGP_BATCH_SIZE;
+    if (batchStart >= numPixels) {
+        return;
+    }
+
+    const uint remaining = numPixels - batchStart;
+    const uint actualBatch = remaining < NGP_BATCH_SIZE ? remaining : (uint)NGP_BATCH_SIZE;
+
+    threadgroup half encodedStorage[NGP_BATCH_SIZE * NGP_TOTAL_FEATURES];
+    threadgroup float hiddenAccumStorage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
+    threadgroup half hiddenStorage[NGP_BATCH_SIZE * NGP_MLP_HIDDEN_WIDTH];
+    threadgroup float outputAccumStorage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
+    threadgroup half outputStorage[NGP_BATCH_SIZE * NGP_MLP_OUTPUT_DIM];
+    threadgroup uchar sampleMask[NGP_BATCH_SIZE];
+
+    InstantNGPTexturePositionLoader loader{
+        textureWidth,
+        textureHeight,
+        uniforms.trainingWidth,
+        uniforms.trainingHeight
+    };
+    InstantNGPTextureOutputWriter writer{outTexture, textureWidth, textureHeight};
+
+    instantNGPRunCooperativeBatch(
+        mlpLayers,
+        mlpLayerCount,
+        hashTable,
+        loader,
+        writer,
+        batchStart,
+        actualBatch,
+        linearThreadId,
+        threadgroupSize,
+        encodedStorage,
+        hiddenAccumStorage,
+        hiddenStorage,
+        outputAccumStorage,
+        outputStorage,
+        sampleMask
+    );
 }

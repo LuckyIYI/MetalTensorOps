@@ -7,6 +7,7 @@ private let isRunningTests: Bool = {
 @main
 struct MetalTensorOpApp: App {
     @State private var selectedModel: ModelKind = .instantNGP
+    @State private var selectedRenderMode: RenderMode = .cooperative
 
     var body: some Scene {
         WindowGroup {
@@ -21,26 +22,20 @@ struct MetalTensorOpApp: App {
                         .pickerStyle(.segmented)
                         .padding()
 
+                        Picker("Render Mode", selection: $selectedRenderMode) {
+                            ForEach(RenderMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .padding([.horizontal, .bottom])
+
                         ContentView()
                             .environment(\.modelKind, selectedModel)
+                            .environment(\.renderMode, selectedRenderMode)
 
                         Spacer()
 
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Neural Rendering Comparison")
-                                .font(.headline)
-                            Text("• Siren: Sinusoidal activation networks")
-                                .font(.caption)
-                            Text("• Fourier: Positional encoding + ReLU")
-                                .font(.caption)
-                            Text("• Instant NGP: Hash encoding + cooperative MLP")
-                                .font(.caption)
-                                .foregroundColor(.green)
-                        }
-                        .padding()
-                        .background(Color.gray.opacity(0.1))
-                        .cornerRadius(10)
-                        .padding()
                     }
                     .navigationTitle("MetalTensorOp")
                 }

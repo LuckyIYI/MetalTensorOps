@@ -3,7 +3,7 @@ import Combine
 import Metal
 import MetalKit
 
-enum ModelKind: String, CaseIterable {
+enum ModelKind: String, CaseIterable, Hashable {
     case siren = "Siren"
     case fourier = "Fourier"
     case instantNGP = "Instant NGP"
@@ -21,7 +21,14 @@ extension EnvironmentValues {
 }
 
 protocol ComputeEncoder {
-    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer)
+    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer, mode: RenderMode)
+    func supports(_ mode: RenderMode) -> Bool
+}
+
+extension ComputeEncoder {
+    func supports(_ mode: RenderMode) -> Bool {
+        mode == .perPixel
+    }
 }
 
 #if os(macOS)
@@ -124,9 +131,11 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     private var drawingEnabled = false
 
     let modelKind: ModelKind
+    var renderMode: RenderMode
 
-    init(modelKind: ModelKind = .siren) {
+    init(modelKind: ModelKind = .siren, renderMode: RenderMode = .perPixel) {
         self.modelKind = modelKind
+        self.renderMode = renderMode
         super.init()
     }
 
@@ -290,7 +299,9 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
 
         commandBuffer.beginCommandBuffer(allocator: commandAllocator)
 
-        encoder.encode(drawableTexture: drawable.texture, commandBuffer: commandBuffer)
+        let desiredMode = renderMode
+        let actualMode = encoder.supports(desiredMode) ? desiredMode : .perPixel
+        encoder.encode(drawableTexture: drawable.texture, commandBuffer: commandBuffer, mode: actualMode)
         commandBuffer.endCommandBuffer()
 
         commandQueue.waitForDrawable(drawable)
@@ -343,9 +354,10 @@ extension Coordinator {
 @available(macOS 26.0, iOS 16.0, *)
 struct ContentView: View {
     @Environment(\.modelKind) private var modelKind
+    @Environment(\.renderMode) private var renderMode
 
     var body: some View {
-        let coordinator = Coordinator(modelKind: modelKind)
+        let coordinator = Coordinator(modelKind: modelKind, renderMode: renderMode)
         let width = coordinator.imageWidth.map { CGFloat($0) } ?? 300
         let height = coordinator.imageHeight.map { CGFloat($0) } ?? 300
         
@@ -353,7 +365,7 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
             MetalCircleView(coordinator: coordinator)
                 .frame(width: width, height: height)
-                .id(modelKind)
+                .id("\(modelKind.rawValue)|\(renderMode.rawValue)")
         }
     }
 }
@@ -361,4 +373,5 @@ struct ContentView: View {
 #Preview {
     ContentView()
         .environment(\.modelKind, .siren)
+        .environment(\.renderMode, .perPixel)
 }

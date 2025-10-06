@@ -8,24 +8,20 @@ enum SirenEncoderError: Error {
     case failedToCreateBuffer
 }
 
-struct MLPTensorArguments {
-    var weight: InlineArray<16, MTLResourceID>
-    var bias: InlineArray<16, MTLResourceID>
-    
-    init() {
-        weight = .init(repeating: .init())
-        bias = .init(repeating: .init())
-    }
-}
-
 final class SirenEncoder: ComputeEncoder {
     let pipelineState: MTLComputePipelineState
+    let cooperativePipelineState: MTLComputePipelineState
+    let cooperativeBufferPipelineState: MTLComputePipelineState
     var argumentTable: any MTL4ArgumentTable
+    var bufferArgumentTable: any MTL4ArgumentTable
     let residencySet: MTLResidencySet
     private let mlp: MLP
     private var timeBuffer: MTLBuffer
     private let tensorArgumentsBuffer: MTLBuffer
     private let layerCountBuffer: MTLBuffer
+    private let numSamplesBuffer: MTLBuffer
+
+    private let batchSize: Int = 32
 
     init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
@@ -36,6 +32,20 @@ final class SirenEncoder: ComputeEncoder {
         pipelineDescriptor.computeFunctionDescriptor = functionDescriptor
         
         self.pipelineState = try compiler.makeComputePipelineState(descriptor: pipelineDescriptor)
+
+        let coopFunctionDescriptor = MTL4LibraryFunctionDescriptor()
+        coopFunctionDescriptor.name = "sirenMLPCoop"
+        coopFunctionDescriptor.library = library
+        let coopPipelineDescriptor = MTL4ComputePipelineDescriptor()
+        coopPipelineDescriptor.computeFunctionDescriptor = coopFunctionDescriptor
+        self.cooperativePipelineState = try compiler.makeComputePipelineState(descriptor: coopPipelineDescriptor)
+
+        let coopBufferFunctionDescriptor = MTL4LibraryFunctionDescriptor()
+        coopBufferFunctionDescriptor.name = "sirenMLPCoopBuffer"
+        coopBufferFunctionDescriptor.library = library
+        let coopBufferPipelineDescriptor = MTL4ComputePipelineDescriptor()
+        coopBufferPipelineDescriptor.computeFunctionDescriptor = coopBufferFunctionDescriptor
+        self.cooperativeBufferPipelineState = try compiler.makeComputePipelineState(descriptor: coopBufferPipelineDescriptor)
                 
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
@@ -60,7 +70,7 @@ final class SirenEncoder: ComputeEncoder {
         desc.maxBufferBindCount = 3
         desc.maxTextureBindCount = 1
 
-        var mlpTensorArguments = MLPTensorArguments()
+        var mlpTensorArguments = MetalMLPTensorArguments()
         for i in 0..<mlp.layers.count {
             mlpTensorArguments.weight[i] = mlp.layers[i].weightTensor.gpuResourceID
         }
@@ -68,11 +78,11 @@ final class SirenEncoder: ComputeEncoder {
             mlpTensorArguments.bias[i] = mlp.layers[i].biasTensor.gpuResourceID
         }
 
-        guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<MLPTensorArguments>.stride, options: .storageModeShared) else {
+        guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<MetalMLPTensorArguments>.stride, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer
         }
         self.tensorArgumentsBuffer = tensorArgumentsBuffer
-        memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<MLPTensorArguments>.stride)
+        memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<MetalMLPTensorArguments>.stride)
 
         var layerCount32 = UInt32(mlp.layers.count)
         guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared) else {
@@ -86,9 +96,21 @@ final class SirenEncoder: ComputeEncoder {
         }
         self.timeBuffer = timeBuffer
 
+        guard let numSamplesBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+            throw SirenEncoderError.failedToCreateBuffer
+        }
+        self.numSamplesBuffer = numSamplesBuffer
+
         self.argumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
         self.argumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
         self.argumentTable.setAddress(timeBuffer.gpuAddress, index: 2)
+
+        let bufferTableDesc = MTL4ArgumentTableDescriptor()
+        bufferTableDesc.maxBufferBindCount = 5
+        self.bufferArgumentTable = try device.makeArgumentTable(descriptor: bufferTableDesc)
+        bufferArgumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
+        bufferArgumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
+        bufferArgumentTable.setAddress(numSamplesBuffer.gpuAddress, index: 4)
 
         let residency = try device.makeResidencySet(descriptor: .init())
         queue.addResidencySet(residency)
@@ -109,28 +131,82 @@ final class SirenEncoder: ComputeEncoder {
         residency.addAllocation(layerCountBuffer)
         residency.addAllocation(tensorArgumentsBuffer)
         residency.addAllocation(timeBuffer)
+        residency.addAllocation(numSamplesBuffer)
 
         residency.commit()
         self.residencySet = residency
     }
 
-    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer) {
+    func supports(_ mode: RenderMode) -> Bool {
+        switch mode {
+        case .perPixel, .cooperative:
+            return true
+        }
+    }
+
+    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer, mode: RenderMode) {
         var t = Float(CACurrentMediaTime())
         memcpy(timeBuffer.contents(), &t, MemoryLayout<Float>.size)
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
         commandBuffer.useResidencySet(residencySet)
-        encoder.setComputePipelineState(pipelineState)
         encoder.setArgumentTable(argumentTable)
-
         argumentTable.setTexture(drawableTexture.gpuResourceID, index: 0)
 
-        encoder.dispatchThreads(
-            threadsPerGrid: .init(width: drawableTexture.width, height: drawableTexture.height, depth: 1),
-            threadsPerThreadgroup: .init(width: 16, height: 16, depth: 1)
-        )
+        switch mode {
+        case .perPixel:
+            encoder.setComputePipelineState(pipelineState)
+            encoder.dispatchThreads(
+                threadsPerGrid: .init(width: drawableTexture.width, height: drawableTexture.height, depth: 1),
+                threadsPerThreadgroup: .init(width: 16, height: 16, depth: 1)
+            )
 
+        case .cooperative:
+            encoder.setComputePipelineState(cooperativePipelineState)
+            let numPixels = drawableTexture.width * drawableTexture.height
+            let threadsPerThreadgroup = MTLSize(
+                width: cooperativePipelineState.threadExecutionWidth * 4,
+                height: 1,
+                depth: 1
+            )
+            let batches = max(1, (numPixels + batchSize - 1) / batchSize)
+            let threadgroupsPerGrid = MTLSize(width: batches, height: 1, depth: 1)
+            encoder.dispatchThreadgroups(
+                threadgroupsPerGrid: threadgroupsPerGrid,
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
+
+        encoder.endEncoding()
+    }
+
+    func encodeCooperativeBuffer(
+        positions: MTLBuffer,
+        outputs: MTLBuffer,
+        numSamples: UInt32,
+        commandBuffer: MTL4CommandBuffer
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        commandBuffer.useResidencySet(residencySet)
+        encoder.setComputePipelineState(cooperativeBufferPipelineState)
+        encoder.setArgumentTable(bufferArgumentTable)
+        bufferArgumentTable.setAddress(positions.gpuAddress, index: 2)
+        bufferArgumentTable.setAddress(outputs.gpuAddress, index: 3)
+        var count = numSamples
+        memcpy(numSamplesBuffer.contents(), &count, MemoryLayout<UInt32>.stride)
+
+        let threadsPerThreadgroup = MTLSize(
+            width: cooperativeBufferPipelineState.threadExecutionWidth * 4,
+            height: 1,
+            depth: 1
+        )
+        let batches = max(1, (Int(numSamples) + batchSize - 1) / batchSize)
+        let threadgroupsPerGrid = MTLSize(width: batches, height: 1, depth: 1)
+        encoder.dispatchThreadgroups(
+            threadgroupsPerGrid: threadgroupsPerGrid,
+            threadsPerThreadgroup: threadsPerThreadgroup
+        )
         encoder.endEncoding()
     }
 }

@@ -30,19 +30,21 @@ final class InstantNGPEncoder: ComputeEncoder {
     private let queue: MTL4CommandQueue
 
     private let renderPipelineState: MTLComputePipelineState
-    private let inferencePipelineState: MTLComputePipelineState
-    private let inferenceDebugPipelineState: MTLComputePipelineState
+    private let renderCoopPipelineState: MTLComputePipelineState
+    private let cooperativeBufferPipelineState: MTLComputePipelineState
 
     private let renderArgumentTable: any MTL4ArgumentTable
-    private let inferenceArgumentTable: any MTL4ArgumentTable
-    private let inferenceDebugArgumentTable: any MTL4ArgumentTable
+    private let renderCoopArgumentTable: any MTL4ArgumentTable
+    private let cooperativeBufferArgumentTable: any MTL4ArgumentTable
 
     private let renderResidencySet: MTLResidencySet
-    private let inferenceResidencySet: MTLResidencySet
+    private let cooperativeBufferResidencySet: MTLResidencySet
 
     private let weights: InstantNGPMetalWeights
     private let renderUniformsBuffer: MTLBuffer
     private let numPositionsBuffer: MTLBuffer
+    private let tensorArgumentsBuffer: MTLBuffer
+    private let layerCountBuffer: MTLBuffer
 
     struct RenderUniforms {
         var time: Float
@@ -80,6 +82,25 @@ final class InstantNGPEncoder: ComputeEncoder {
         }
         self.numPositionsBuffer = numPositionsBuffer
 
+        var mlpTensorArguments = MetalMLPTensorArguments()
+        for (index, layer) in weights.mlp.layers.enumerated() {
+            mlpTensorArguments.weight[index] = layer.weightTensor.gpuResourceID
+            mlpTensorArguments.bias[index] = layer.biasTensor.gpuResourceID
+        }
+
+        guard let tensorArgumentsBuffer = device.makeBuffer(length: MemoryLayout<MetalMLPTensorArguments>.stride, options: .storageModeShared) else {
+            throw InstantNGPError.failedToCreateBuffer
+        }
+        memcpy(tensorArgumentsBuffer.contents(), &mlpTensorArguments, MemoryLayout<MetalMLPTensorArguments>.stride)
+        self.tensorArgumentsBuffer = tensorArgumentsBuffer
+
+        var layerCount = UInt32(weights.mlp.layers.count)
+        guard let layerCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+            throw InstantNGPError.failedToCreateBuffer
+        }
+        memcpy(layerCountBuffer.contents(), &layerCount, MemoryLayout<UInt32>.stride)
+        self.layerCountBuffer = layerCountBuffer
+
         let renderFn = MTL4LibraryFunctionDescriptor()
         renderFn.name = "instantNGPRender"
         renderFn.library = library
@@ -87,50 +108,46 @@ final class InstantNGPEncoder: ComputeEncoder {
         renderDesc.computeFunctionDescriptor = renderFn
         self.renderPipelineState = try compiler.makeComputePipelineState(descriptor: renderDesc)
 
-        let inferenceFn = MTL4LibraryFunctionDescriptor()
-        inferenceFn.name = "instantNGPInference"
-        inferenceFn.library = library
-        let inferenceDesc = MTL4ComputePipelineDescriptor()
-        inferenceDesc.computeFunctionDescriptor = inferenceFn
-        self.inferencePipelineState = try compiler.makeComputePipelineState(descriptor: inferenceDesc)
+        let renderCoopFn = MTL4LibraryFunctionDescriptor()
+        renderCoopFn.name = "instantNGPRenderCoop"
+        renderCoopFn.library = library
+        let renderCoopDesc = MTL4ComputePipelineDescriptor()
+        renderCoopDesc.computeFunctionDescriptor = renderCoopFn
+        self.renderCoopPipelineState = try compiler.makeComputePipelineState(descriptor: renderCoopDesc)
 
-        let debugFn = MTL4LibraryFunctionDescriptor()
-        debugFn.name = "instantNGPInferenceDebug"
-        debugFn.library = library
-        let debugDesc = MTL4ComputePipelineDescriptor()
-        debugDesc.computeFunctionDescriptor = debugFn
-        self.inferenceDebugPipelineState = try compiler.makeComputePipelineState(descriptor: debugDesc)
+        let cooperativeBufferFn = MTL4LibraryFunctionDescriptor()
+        cooperativeBufferFn.name = "instantNGPCoopBuffer"
+        cooperativeBufferFn.library = library
+        let cooperativeBufferDesc = MTL4ComputePipelineDescriptor()
+        cooperativeBufferDesc.computeFunctionDescriptor = cooperativeBufferFn
+        self.cooperativeBufferPipelineState = try compiler.makeComputePipelineState(descriptor: cooperativeBufferDesc)
 
         let renderTableDesc = MTL4ArgumentTableDescriptor()
         renderTableDesc.maxTextureBindCount = 1
-        renderTableDesc.maxBufferBindCount = 6
+        renderTableDesc.maxBufferBindCount = 4
         self.renderArgumentTable = try device.makeArgumentTable(descriptor: renderTableDesc)
-        renderArgumentTable.setResource(weights.layer1Weights.gpuResourceID, bufferIndex: 0)
-        renderArgumentTable.setResource(weights.layer1Bias.gpuResourceID, bufferIndex: 1)
-        renderArgumentTable.setResource(weights.layer2Weights.gpuResourceID, bufferIndex: 2)
-        renderArgumentTable.setResource(weights.layer2Bias.gpuResourceID, bufferIndex: 3)
-        renderArgumentTable.setAddress(weights.hashTable.gpuAddress, index: 4)
-        renderArgumentTable.setAddress(renderUniformsBuffer.gpuAddress, index: 5)
+        renderArgumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
+        renderArgumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
+        renderArgumentTable.setAddress(weights.hashTable.gpuAddress, index: 2)
+        renderArgumentTable.setAddress(renderUniformsBuffer.gpuAddress, index: 3)
 
-        let inferenceTableDesc = MTL4ArgumentTableDescriptor()
-        inferenceTableDesc.maxBufferBindCount = 8
-        self.inferenceArgumentTable = try device.makeArgumentTable(descriptor: inferenceTableDesc)
-        inferenceArgumentTable.setResource(weights.layer1Weights.gpuResourceID, bufferIndex: 0)
-        inferenceArgumentTable.setResource(weights.layer1Bias.gpuResourceID, bufferIndex: 1)
-        inferenceArgumentTable.setResource(weights.layer2Weights.gpuResourceID, bufferIndex: 2)
-        inferenceArgumentTable.setResource(weights.layer2Bias.gpuResourceID, bufferIndex: 3)
-        inferenceArgumentTable.setAddress(weights.hashTable.gpuAddress, index: 4)
-        inferenceArgumentTable.setAddress(numPositionsBuffer.gpuAddress, index: 7)
+        let renderCoopTableDesc = MTL4ArgumentTableDescriptor()
+        renderCoopTableDesc.maxTextureBindCount = 1
+        renderCoopTableDesc.maxBufferBindCount = 5
+        self.renderCoopArgumentTable = try device.makeArgumentTable(descriptor: renderCoopTableDesc)
+        renderCoopArgumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
+        renderCoopArgumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
+        renderCoopArgumentTable.setAddress(weights.hashTable.gpuAddress, index: 2)
+        renderCoopArgumentTable.setAddress(renderUniformsBuffer.gpuAddress, index: 3)
+        renderCoopArgumentTable.setAddress(numPositionsBuffer.gpuAddress, index: 4)
 
-        let debugTableDesc = MTL4ArgumentTableDescriptor()
-        debugTableDesc.maxBufferBindCount = 11
-        self.inferenceDebugArgumentTable = try device.makeArgumentTable(descriptor: debugTableDesc)
-        inferenceDebugArgumentTable.setResource(weights.layer1Weights.gpuResourceID, bufferIndex: 0)
-        inferenceDebugArgumentTable.setResource(weights.layer1Bias.gpuResourceID, bufferIndex: 1)
-        inferenceDebugArgumentTable.setResource(weights.layer2Weights.gpuResourceID, bufferIndex: 2)
-        inferenceDebugArgumentTable.setResource(weights.layer2Bias.gpuResourceID, bufferIndex: 3)
-        inferenceDebugArgumentTable.setAddress(weights.hashTable.gpuAddress, index: 4)
-        inferenceDebugArgumentTable.setAddress(numPositionsBuffer.gpuAddress, index: 7)
+        let cooperativeBufferTableDesc = MTL4ArgumentTableDescriptor()
+        cooperativeBufferTableDesc.maxBufferBindCount = 6
+        self.cooperativeBufferArgumentTable = try device.makeArgumentTable(descriptor: cooperativeBufferTableDesc)
+        cooperativeBufferArgumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
+        cooperativeBufferArgumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
+        cooperativeBufferArgumentTable.setAddress(weights.hashTable.gpuAddress, index: 2)
+        cooperativeBufferArgumentTable.setAddress(numPositionsBuffer.gpuAddress, index: 5)
 
         let renderResidency = try device.makeResidencySet(descriptor: .init())
         queue.addResidencySet(renderResidency)
@@ -138,71 +155,100 @@ final class InstantNGPEncoder: ComputeEncoder {
         let addTensor: (MTLTensor, MTLResidencySet) -> Void = { tensor, residency in
             residency.addAllocation(tensor)
         }
-        addTensor(weights.layer1Weights, renderResidency)
-        addTensor(weights.layer1Bias, renderResidency)
-        addTensor(weights.layer2Weights, renderResidency)
-        addTensor(weights.layer2Bias, renderResidency)
+        for layer in weights.mlp.layers {
+            addTensor(layer.weightTensor, renderResidency)
+            addTensor(layer.biasTensor, renderResidency)
+        }
         renderResidency.addAllocation(renderUniformsBuffer)
+        renderResidency.addAllocation(numPositionsBuffer)
+        renderResidency.addAllocation(tensorArgumentsBuffer)
+        renderResidency.addAllocation(layerCountBuffer)
         renderResidency.commit()
         self.renderResidencySet = renderResidency
 
-        let inferenceResidency = try device.makeResidencySet(descriptor: .init())
-        queue.addResidencySet(inferenceResidency)
-        inferenceResidency.addAllocation(weights.hashTable)
-        addTensor(weights.layer1Weights, inferenceResidency)
-        addTensor(weights.layer1Bias, inferenceResidency)
-        addTensor(weights.layer2Weights, inferenceResidency)
-        addTensor(weights.layer2Bias, inferenceResidency)
-        inferenceResidency.addAllocation(numPositionsBuffer)
-        inferenceResidency.commit()
-        self.inferenceResidencySet = inferenceResidency
+        let cooperativeBufferResidency = try device.makeResidencySet(descriptor: .init())
+        queue.addResidencySet(cooperativeBufferResidency)
+        cooperativeBufferResidency.addAllocation(weights.hashTable)
+        for layer in weights.mlp.layers {
+            addTensor(layer.weightTensor, cooperativeBufferResidency)
+            addTensor(layer.biasTensor, cooperativeBufferResidency)
+        }
+        cooperativeBufferResidency.addAllocation(numPositionsBuffer)
+        cooperativeBufferResidency.addAllocation(tensorArgumentsBuffer)
+        cooperativeBufferResidency.addAllocation(layerCountBuffer)
+        cooperativeBufferResidency.commit()
+        self.cooperativeBufferResidencySet = cooperativeBufferResidency
     }
 
 
-    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer) {
+    func supports(_ mode: RenderMode) -> Bool {
+        switch mode {
+        case .perPixel, .cooperative:
+            return true
+        }
+    }
+
+    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer, mode: RenderMode) {
         let pointer = renderUniformsBuffer.contents().bindMemory(to: RenderUniforms.self, capacity: 1)
         pointer.pointee.time = Float(CACurrentMediaTime())
 
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        commandBuffer.useResidencySet(renderResidencySet)
-        encoder.setComputePipelineState(renderPipelineState)
-        encoder.setArgumentTable(renderArgumentTable)
-        renderArgumentTable.setTexture(drawableTexture.gpuResourceID, index: 0)
+        switch mode {
+        case .perPixel:
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+            commandBuffer.useResidencySet(renderResidencySet)
+            encoder.setComputePipelineState(renderPipelineState)
+            encoder.setArgumentTable(renderArgumentTable)
+            renderArgumentTable.setTexture(drawableTexture.gpuResourceID, index: 0)
 
-        let gridSize = MTLSize(width: drawableTexture.width, height: drawableTexture.height, depth: 1)
-        guard gridSize.width > 0 && gridSize.height > 0 else {
+            let gridSize = MTLSize(width: drawableTexture.width, height: drawableTexture.height, depth: 1)
+            guard gridSize.width > 0 && gridSize.height > 0 else {
+                encoder.endEncoding()
+                return
+            }
+
+            let threadsPerThreadgroup = MTLSize(
+                width: 16,
+                height: 16,
+                depth: 1
+            )
+
+            encoder.dispatchThreads(threadsPerGrid: gridSize, threadsPerThreadgroup: threadsPerThreadgroup)
             encoder.endEncoding()
-            return
+
+        case .cooperative:
+            encodeRenderCooperative(drawableTexture: drawableTexture, commandBuffer: commandBuffer)
         }
-
-        let threadsPerThreadgroup = MTLSize(
-            width: 16,
-            height: 16,
-            depth: 1
-        )
-
-        encoder.dispatchThreads(threadsPerGrid: gridSize, threadsPerThreadgroup: threadsPerThreadgroup)
-        encoder.endEncoding()
     }
 
-    func encodeInference(
-        positions: MTLTensor,
-        outputs: MTLTensor,
-        numPositions: UInt32,
+    func encodeRenderCooperative(
+        drawableTexture: MTLTexture,
         commandBuffer: MTL4CommandBuffer
     ) {
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        commandBuffer.useResidencySet(inferenceResidencySet)
-        encoder.setComputePipelineState(inferencePipelineState)
-        encoder.setArgumentTable(inferenceArgumentTable)
-        inferenceArgumentTable.setResource(positions.gpuResourceID, bufferIndex: 5)
-        inferenceArgumentTable.setResource(outputs.gpuResourceID, bufferIndex: 6)
-        var count = numPositions
+        let width = drawableTexture.width
+        let height = drawableTexture.height
+        guard width > 0 && height > 0 else { return }
+
+        let pointer = renderUniformsBuffer.contents().bindMemory(to: RenderUniforms.self, capacity: 1)
+        pointer.pointee.time = Float(CACurrentMediaTime())
+
+        let numPixels = width * height
+        var count = UInt32(numPixels)
         memcpy(numPositionsBuffer.contents(), &count, MemoryLayout<UInt32>.stride)
 
-        let threadsPerThreadgroup = MTLSize(width: inferencePipelineState.threadExecutionWidth * 4, height: 1, depth: 1)
-        let numBatches = max(1, (Int(numPositions) + InstantNGPConfig.batchSize - 1) / InstantNGPConfig.batchSize)
-        let threadgroupsPerGrid = MTLSize(width: 1, height: numBatches, depth: 1)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        commandBuffer.useResidencySet(renderResidencySet)
+        encoder.setComputePipelineState(renderCoopPipelineState)
+        encoder.setArgumentTable(renderCoopArgumentTable)
+        renderCoopArgumentTable.setTexture(drawableTexture.gpuResourceID, index: 0)
+
+        let threadsPerThreadgroup = MTLSize(
+            width: renderCoopPipelineState.threadExecutionWidth * 4,
+            height: 1,
+            depth: 1
+        )
+        let numBatches = max(1, (numPixels + InstantNGPConfig.batchSize - 1) / InstantNGPConfig.batchSize)
+        let threadgroupsPerGrid = MTLSize(width: numBatches, height: 1, depth: 1)
+
         encoder.dispatchThreadgroups(
             threadgroupsPerGrid: threadgroupsPerGrid,
             threadsPerThreadgroup: threadsPerThreadgroup
@@ -210,28 +256,26 @@ final class InstantNGPEncoder: ComputeEncoder {
         encoder.endEncoding()
     }
 
-    func encodeInferenceDebug(
+    func encodeCooperativeBuffer(
         positions: MTLTensor,
         outputs: MTLTensor,
         numPositions: UInt32,
-        encodedDebug: MTLTensor,
-        hiddenDebug: MTLTensor,
-        outputDebug: MTLTensor,
         commandBuffer: MTL4CommandBuffer
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        commandBuffer.useResidencySet(inferenceResidencySet)
-        encoder.setComputePipelineState(inferenceDebugPipelineState)
-        encoder.setArgumentTable(inferenceDebugArgumentTable)
-        inferenceDebugArgumentTable.setResource(positions.gpuResourceID, bufferIndex: 5)
-        inferenceDebugArgumentTable.setResource(outputs.gpuResourceID, bufferIndex: 6)
-        inferenceDebugArgumentTable.setResource(encodedDebug.gpuResourceID, bufferIndex: 8)
-        inferenceDebugArgumentTable.setResource(hiddenDebug.gpuResourceID, bufferIndex: 9)
-        inferenceDebugArgumentTable.setResource(outputDebug.gpuResourceID, bufferIndex: 10)
+        commandBuffer.useResidencySet(cooperativeBufferResidencySet)
+        encoder.setComputePipelineState(cooperativeBufferPipelineState)
+        encoder.setArgumentTable(cooperativeBufferArgumentTable)
+        cooperativeBufferArgumentTable.setResource(positions.gpuResourceID, bufferIndex: 3)
+        cooperativeBufferArgumentTable.setResource(outputs.gpuResourceID, bufferIndex: 4)
         var count = numPositions
         memcpy(numPositionsBuffer.contents(), &count, MemoryLayout<UInt32>.stride)
 
-        let threadsPerThreadgroup = MTLSize(width: inferenceDebugPipelineState.threadExecutionWidth * 4, height: 1, depth: 1)
+        let threadsPerThreadgroup = MTLSize(
+            width: cooperativeBufferPipelineState.threadExecutionWidth * 4,
+            height: 1,
+            depth: 1
+        )
         let numBatches = max(1, (Int(numPositions) + InstantNGPConfig.batchSize - 1) / InstantNGPConfig.batchSize)
         let threadgroupsPerGrid = MTLSize(width: 1, height: numBatches, depth: 1)
         encoder.dispatchThreadgroups(
