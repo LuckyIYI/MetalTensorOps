@@ -249,3 +249,137 @@ struct FourierParams: Codable {
         try container.encode(matrix, forKey: .B)
     }
 }
+
+struct InstantNGPMetalWeights {
+    let hashTable: MTLBuffer
+    let encoding: InstantNGPEncoding
+    let mlp: MLP
+    let imageWidth: Int
+    let imageHeight: Int
+}
+
+struct InstantNGPEncoding: Codable {
+    struct HashTable: Codable {
+        let shape: [Int]
+        let data: [Float]
+    }
+
+    let numLevels: Int
+    let featuresPerLevel: Int
+    let log2HashmapSize: Int
+    let baseResolution: Int
+    let maxResolution: Int
+    let hashTable: HashTable
+
+    private enum CodingKeys: String, CodingKey {
+        case numLevels = "num_levels"
+        case featuresPerLevel = "features_per_level"
+        case log2HashmapSize = "log2_hashmap_size"
+        case baseResolution = "base_resolution"
+        case maxResolution = "max_resolution"
+        case hashTable = "hash_table"
+    }
+}
+
+struct InstantNGPModel: Codable {
+    let metadata: Metadata?
+    let model: ModelDescriptor?
+    let encoding: InstantNGPEncoding
+    let mlp: MLP?
+    let sampleCount: Int?
+    let sampleSeed: UInt64?
+    let samples: [ModelSample]?
+
+    private enum CodingKeys: String, CodingKey {
+        case metadata
+        case model
+        case encoding
+        case mlp
+        case sampleCount = "sample_count"
+        case sampleSeed = "sample_seed"
+        case samples
+    }
+}
+
+extension InstantNGPModel {
+    static func load(from url: URL) throws -> InstantNGPModel {
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(InstantNGPModel.self, from: data)
+    }
+
+    func makeMetalWeights(device: MTLDevice) throws -> InstantNGPMetalWeights {
+        guard let mlp else {
+            throw InstantNGPError.invalidConfiguration
+        }
+        guard mlp.layers.count >= 2 else {
+            throw InstantNGPError.invalidConfiguration
+        }
+
+        guard encoding.numLevels == InstantNGPConfig.numLevels,
+              encoding.featuresPerLevel == InstantNGPConfig.featuresPerLevel,
+              encoding.log2HashmapSize == InstantNGPConfig.log2HashmapSize,
+              encoding.baseResolution == InstantNGPConfig.baseResolution,
+              encoding.maxResolution == InstantNGPConfig.maxResolution else {
+            throw InstantNGPError.invalidConfiguration
+        }
+
+        let expectedHashCount = encoding.numLevels * encoding.featuresPerLevel * (1 << encoding.log2HashmapSize)
+        let expandedHash = expandHashData(values: encoding.hashTable.data, expectedCount: expectedHashCount)
+
+        let hashData = expandedHash.map { Float16($0) }
+        guard let hashBuffer = device.makeBuffer(
+            bytes: hashData,
+            length: hashData.count * MemoryLayout<Float16>.stride,
+            options: .storageModeShared
+        ) else {
+            throw InstantNGPError.failedToCreateBuffer
+        }
+
+        let imageWidth = metadata?.image?.width ?? 0
+        let imageHeight = metadata?.image?.height ?? 0
+
+        return InstantNGPMetalWeights(
+            hashTable: hashBuffer,
+            encoding: encoding,
+            mlp: mlp,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight
+        )
+    }
+
+    func makeSampleDataset() throws -> [ModelSamplePoint] {
+        guard let samples else {
+            throw ModelSampleError.missingSamples
+        }
+
+        return try samples.map { sample in
+            guard sample.position.count == 2, sample.value.count == 3 else {
+                throw ModelSampleError.invalidSampleDimensions
+            }
+            return ModelSamplePoint(
+                position: SIMD2(Float(sample.position[0]), Float(sample.position[1])),
+                value: SIMD3(Float(sample.value[0]), Float(sample.value[1]), Float(sample.value[2]))
+            )
+        }
+    }
+
+    func makeModelSampleDataset() throws -> [ModelSamplePoint] {
+        try makeSampleDataset()
+    }
+
+    private func expandHashData(values: [Float], expectedCount: Int) -> [Float] {
+        guard !values.isEmpty else {
+            return Array(repeating: 0, count: expectedCount)
+        }
+
+        if values.count == expectedCount {
+            return values
+        }
+
+        var expanded = [Float](repeating: 0, count: expectedCount)
+        for index in 0..<expectedCount {
+            expanded[index] = values[index % values.count]
+        }
+        return expanded
+    }
+}

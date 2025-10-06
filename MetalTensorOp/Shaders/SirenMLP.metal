@@ -14,6 +14,13 @@ using namespace mpp::tensor_ops;
 #define SIREN_BATCH_SIZE 32
 #define SIREN_MAX_DIM HIDDEN_DIM
 
+struct SirenRenderUniforms {
+    float time;
+    uint trainingWidth;
+    uint trainingHeight;
+    uint _padding;
+};
+
 template<typename LoadInput, typename StoreOutput>
 inline void sirenRunCooperativeBatch(
     constant DeviceMLPLayers &mlpLayers,
@@ -124,7 +131,7 @@ inline void sirenRunCooperativeBatch(
             float value = accumStorage[outputIdx + batchIdx * outputDim] + float(biases[outputIdx]);
 
             if (isLastLayer) {
-                outputStorage[batchIdx * OUTPUT_DIM + outputIdx] = half(value);
+                outputStorage[batchIdx * OUTPUT_DIM + outputIdx] = half(activation_sigmoid(value));
             } else {
                 float activated = sin(omega * value);
                 nextActivation[batchIdx * SIREN_MAX_DIM + outputIdx] = half(activated);
@@ -155,21 +162,47 @@ inline void sirenRunCooperativeBatch(
 }
 
 struct SirenTextureInputLoader {
-    texture2d<float, access::write> outTexture;
     uint textureWidth;
     uint textureHeight;
+    uint trainingWidth;
+    uint trainingHeight;
 
     inline uchar operator()(uint sampleIndex, uint localIdx, threadgroup half *activationBase) const {
         const uint x = sampleIndex % textureWidth;
         const uint y = sampleIndex / textureWidth;
-        if (x >= textureWidth || y >= textureHeight) {
+        if (x >= textureWidth || y >= textureHeight || textureWidth == 0u || textureHeight == 0u) {
             activationBase[localIdx * INPUT_DIM + 0] = half(0.0f);
             activationBase[localIdx * INPUT_DIM + 1] = half(0.0f);
             return 0;
         }
-        float2 uv = (float2(float(x), float(y)) + float2(0.5f)) / float2(float(textureWidth), float(textureHeight)) * 2.0f - 1.0f;
-        activationBase[localIdx * INPUT_DIM + 0] = half(uv.x);
-        activationBase[localIdx * INPUT_DIM + 1] = half(uv.y);
+
+        float2 uv = (float2(float(x), float(y)) + float2(0.5f)) /
+            float2(max(float(textureWidth), 1.0f), max(float(textureHeight), 1.0f));
+
+        if (trainingWidth > 0u && trainingHeight > 0u) {
+            const float targetAspect = float(trainingWidth) / float(trainingHeight);
+            const float textureAspect = float(textureWidth) / float(textureHeight);
+
+            if (textureAspect > targetAspect) {
+                const float visible = targetAspect / textureAspect;
+                const float left = 0.5f - 0.5f * visible;
+                uv.x = (uv.x - left) / max(visible, 1e-6f);
+            } else if (textureAspect < targetAspect) {
+                const float visible = textureAspect / targetAspect;
+                const float top = 0.5f - 0.5f * visible;
+                uv.y = (uv.y - top) / max(visible, 1e-6f);
+            }
+        }
+
+        if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+            activationBase[localIdx * INPUT_DIM + 0] = half(0.0f);
+            activationBase[localIdx * INPUT_DIM + 1] = half(0.0f);
+            return 0;
+        }
+
+        const float2 mapped = uv * 2.0f - 1.0f;
+        activationBase[localIdx * INPUT_DIM + 0] = half(mapped.x);
+        activationBase[localIdx * INPUT_DIM + 1] = half(mapped.y);
         return 1;
     }
 };
@@ -220,10 +253,40 @@ kernel void sirenMLP(
     texture2d<float, access::write> outTexture [[texture(0)]],
     constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],
-    constant float &time [[buffer(2)]],
+    constant SirenRenderUniforms &uniforms [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const half2 xy = (half2(gid) + 0.5h) / half2(outTexture.get_width(), outTexture.get_height()) * 2.0h - 1.0h;
+    const uint textureWidth = outTexture.get_width();
+    const uint textureHeight = outTexture.get_height();
+
+    if (gid.x >= textureWidth || gid.y >= textureHeight || textureWidth == 0u || textureHeight == 0u) {
+        return;
+    }
+
+    float2 uv = (float2(float(gid.x), float(gid.y)) + float2(0.5f)) /
+        float2(float(textureWidth), float(textureHeight));
+
+    if (uniforms.trainingWidth > 0u && uniforms.trainingHeight > 0u) {
+        const float targetAspect = float(uniforms.trainingWidth) / float(uniforms.trainingHeight);
+        const float textureAspect = float(textureWidth) / float(textureHeight);
+
+        if (textureAspect > targetAspect) {
+            const float visible = targetAspect / textureAspect;
+            const float left = 0.5f - 0.5f * visible;
+            uv.x = (uv.x - left) / max(visible, 1e-6f);
+        } else if (textureAspect < targetAspect) {
+            const float visible = textureAspect / targetAspect;
+            const float top = 0.5f - 0.5f * visible;
+            uv.y = (uv.y - top) / max(visible, 1e-6f);
+        }
+    }
+
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+        outTexture.write(float4(0.0f, 0.0f, 0.0f, 1.0f), gid);
+        return;
+    }
+
+    const half2 xy = half2(uv * 2.0f - 1.0f);
 
     thread half inputMem[HIDDEN_DIM] = { xy.x, xy.y };
     auto input = tensor(inputMem, dextents<int, 2>(HIDDEN_DIM, 1));
@@ -262,7 +325,7 @@ kernel void sirenMLP(
         for (uint i = 0; i < outputDim; ++i) {
             half val = (isLastLayer ? output[i, 0] : hidden[i, 0]) + biases[i];
             if (isLastLayer) {
-                input[i, 0] = val;
+                input[i, 0] = half(activation_sigmoid(float(val)));
             } else if (layerIndex == 0) {
                 input[i, 0] = sin(FIRST_OMEGA0 * val);
             } else {
@@ -284,14 +347,13 @@ kernel void sirenMLPCoop(
     texture2d<float, access::write> outTexture [[texture(0)]],
     constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],
-    constant float &time [[buffer(2)]],
+    constant SirenRenderUniforms &uniforms [[buffer(2)]],
     uint3 threadgroupPositionInGrid [[threadgroup_position_in_grid]],
     ushort threadsPerSimdgroup [[threads_per_simdgroup]],
     ushort3 threadsPerThreadgroup [[threads_per_threadgroup]],
     ushort simdLaneId [[thread_index_in_simdgroup]],
     ushort simdGroupId [[simdgroup_index_in_threadgroup]]
 ) {
-    (void)time;
     const uint threadgroupSize =
         uint(threadsPerThreadgroup.x) * uint(threadsPerThreadgroup.y) * uint(threadsPerThreadgroup.z);
     const uint linearThreadId = uint(simdGroupId) * uint(threadsPerSimdgroup) + uint(simdLaneId);
@@ -314,7 +376,12 @@ kernel void sirenMLPCoop(
     threadgroup half outputStorage[SIREN_BATCH_SIZE * OUTPUT_DIM];
     threadgroup uchar sampleMask[SIREN_BATCH_SIZE];
 
-    SirenTextureInputLoader loader{outTexture, textureWidth, textureHeight};
+    SirenTextureInputLoader loader{
+        textureWidth,
+        textureHeight,
+        uniforms.trainingWidth,
+        uniforms.trainingHeight
+    };
     SirenTextureOutputWriter writer{outTexture, textureWidth, textureHeight};
 
     sirenRunCooperativeBatch(

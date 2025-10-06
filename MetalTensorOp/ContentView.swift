@@ -209,13 +209,13 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
                 encoder = try FourierEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
                 loadMetadata(resourceName: "fourier")
             case .instantNGP:
-                guard let weightsFile = loadInstantNGPWeightsFile() else {
+                guard let ngpModel = loadInstantNGPModel() else {
                     print("[Coordinator] Instant NGP weights unavailable")
                     drawingEnabled = false
                     return
                 }
 
-                let metalWeights = try weightsFile.makeMetalWeights(device: device)
+                let metalWeights = try ngpModel.makeMetalWeights(device: device)
                 let instantEncoder = try InstantNGPEncoder(
                     device: device,
                     library: library,
@@ -223,7 +223,7 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
                     queue: commandQueue,
                     weights: metalWeights
                 )
-                if let image = weightsFile.metadata.image,
+                if let image = ngpModel.metadata?.image,
                    let width = image.width,
                    let height = image.height {
                     imageWidth = width
@@ -335,15 +335,14 @@ extension Coordinator {
         aspectRatio = CGFloat(width) / CGFloat(height)
     }
 
-    private func loadInstantNGPWeightsFile() -> InstantNGPWeightsFile? {
+    private func loadInstantNGPModel() -> InstantNGPModel? {
         guard let url = Bundle.main.url(forResource: "instant_ngp", withExtension: "json") else {
             print("[Coordinator] instant_ngp.json not found in bundle")
             return nil
         }
 
         do {
-            let weights = try InstantNGPWeightsFile.load(from: url)
-            return weights
+            return try InstantNGPModel.load(from: url)
         } catch {
             print("[Coordinator] Failed to load Instant NGP weights: \(error)")
             return nil

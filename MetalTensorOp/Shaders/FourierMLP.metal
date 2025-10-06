@@ -14,6 +14,13 @@ using namespace mpp::tensor_ops;
 #define FOURIER_INPUT_DIM (NUM_FREQ * 2)
 #define FOURIER_MAX_DIM FOURIER_INPUT_DIM
 
+struct FourierRenderUniforms {
+    float time;
+    uint trainingWidth;
+    uint trainingHeight;
+    uint _padding;
+};
+
 struct FourierLayers {
     DeviceMLPLayers mlp;
     tensor<constant float, dextents<int, 2>> BMatrix;
@@ -146,7 +153,7 @@ inline void fourierRunCooperativeBatch(
             float value = accumStorage[outputIdx + batchIdx * outputDim] + float(biases[outputIdx]);
 
             if (isLastLayer) {
-                outputStorage[batchIdx * OUTPUT_DIM + outputIdx] = half(value);
+                outputStorage[batchIdx * OUTPUT_DIM + outputIdx] = half(activation_sigmoid(value));
             } else {
                 float activated = max(value, 0.0f);
                 nextActivation[batchIdx * HIDDEN_DIM + outputIdx] = half(activated);
@@ -179,15 +186,41 @@ inline void fourierRunCooperativeBatch(
 struct FourierTexturePositionLoader {
     uint textureWidth;
     uint textureHeight;
+    uint trainingWidth;
+    uint trainingHeight;
 
     inline bool operator()(uint sampleIndex, thread float2 &xy) const {
         const uint x = sampleIndex % textureWidth;
         const uint y = sampleIndex / textureWidth;
-        if (x >= textureWidth || y >= textureHeight) {
+        if (x >= textureWidth || y >= textureHeight || textureWidth == 0u || textureHeight == 0u) {
             xy = float2(0.0f);
             return false;
         }
-        xy = (float2(float(x), float(y)) + float2(0.5f)) / float2(float(textureWidth), float(textureHeight)) * 2.0f - 1.0f;
+
+        float2 uv = (float2(float(x), float(y)) + float2(0.5f)) /
+            float2(max(float(textureWidth), 1.0f), max(float(textureHeight), 1.0f));
+
+        if (trainingWidth > 0u && trainingHeight > 0u) {
+            const float targetAspect = float(trainingWidth) / float(trainingHeight);
+            const float textureAspect = float(textureWidth) / float(textureHeight);
+
+            if (textureAspect > targetAspect) {
+                const float visible = targetAspect / textureAspect;
+                const float left = 0.5f - 0.5f * visible;
+                uv.x = (uv.x - left) / max(visible, 1e-6f);
+            } else if (textureAspect < targetAspect) {
+                const float visible = textureAspect / targetAspect;
+                const float top = 0.5f - 0.5f * visible;
+                uv.y = (uv.y - top) / max(visible, 1e-6f);
+            }
+        }
+
+        if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+            xy = float2(0.0f);
+            return false;
+        }
+
+        xy = uv * 2.0f - 1.0f;
         return true;
     }
 };
@@ -237,12 +270,43 @@ kernel void fourierMLP(
     constant FourierLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],
     constant float &sigma [[buffer(2)]],
-    constant float &time [[buffer(3)]],
+    constant FourierRenderUniforms &uniforms [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
+    (void)sigma;
+    const uint textureWidth = outTexture.get_width();
+    const uint textureHeight = outTexture.get_height();
+
+    if (gid.x >= textureWidth || gid.y >= textureHeight || textureWidth == 0u || textureHeight == 0u) {
+        return;
+    }
+
+    float2 uv = (float2(float(gid.x), float(gid.y)) + float2(0.5f)) /
+        float2(float(textureWidth), float(textureHeight));
+
+    if (uniforms.trainingWidth > 0u && uniforms.trainingHeight > 0u) {
+        const float targetAspect = float(uniforms.trainingWidth) / float(uniforms.trainingHeight);
+        const float textureAspect = float(textureWidth) / float(textureHeight);
+
+        if (textureAspect > targetAspect) {
+            const float visible = targetAspect / textureAspect;
+            const float left = 0.5f - 0.5f * visible;
+            uv.x = (uv.x - left) / max(visible, 1e-6f);
+        } else if (textureAspect < targetAspect) {
+            const float visible = textureAspect / targetAspect;
+            const float top = 0.5f - 0.5f * visible;
+            uv.y = (uv.y - top) / max(visible, 1e-6f);
+        }
+    }
+
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+        outTexture.write(float4(0.0f, 0.0f, 0.0f, 1.0f), gid);
+        return;
+    }
+
+    float2 xy = uv * 2.0f - 1.0f;
+
     const int fourierDim = NUM_FREQ * 2;
-    // 1. Compute normalized input coords
-    float2 xy = (float2(gid) + 0.5f) / float2(outTexture.get_width(), outTexture.get_height()) * 2.0f - 1.0f;
 
     // 2. Apply Fourier feature mapping:
     thread float fourierFeature[fourierDim];
@@ -288,7 +352,9 @@ kernel void fourierMLP(
             if (isLastLayer) {
                 matmul2d<outputDesc, execution_thread>{}.run(input_tensor, weights, output);
                 for (uint i = 0; i < OUTPUT_DIM; ++i) {
-                    current_activation[i] = output[i, 0] + biases[i];
+                    float linear = float(output[i, 0] + biases[i]);
+                    float activated = activation_sigmoid(linear);
+                    current_activation[i] = half(activated);
                 }
             } else {
                 matmul2d<hiddenDesc, execution_thread>{}.run(input_tensor, weights, hidden);
@@ -314,7 +380,7 @@ kernel void fourierMLPCoop(
     constant FourierLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],
     constant float &sigma [[buffer(2)]],
-    constant float &time [[buffer(3)]],
+    constant FourierRenderUniforms &uniforms [[buffer(3)]],
     uint3 threadgroupPositionInGrid [[threadgroup_position_in_grid]],
     ushort threadsPerSimdgroup [[threads_per_simdgroup]],
     ushort3 threadsPerThreadgroup [[threads_per_threadgroup]],
@@ -329,7 +395,6 @@ kernel void fourierMLPCoop(
     const uint textureHeight = outTexture.get_height();
     const uint numPixels = textureWidth * textureHeight;
     (void)sigma;
-    (void)time;
 
     const uint batchStart = threadgroupPositionInGrid.x * FOURIER_BATCH_SIZE;
     if (batchStart >= numPixels) {
@@ -345,7 +410,12 @@ kernel void fourierMLPCoop(
     threadgroup half outputStorage[FOURIER_BATCH_SIZE * OUTPUT_DIM];
     threadgroup uchar sampleMask[FOURIER_BATCH_SIZE];
 
-    FourierTexturePositionLoader loader{textureWidth, textureHeight};
+    FourierTexturePositionLoader loader{
+        textureWidth,
+        textureHeight,
+        uniforms.trainingWidth,
+        uniforms.trainingHeight
+    };
     FourierTextureOutputWriter writer{outTexture, textureWidth, textureHeight};
 
     fourierRunCooperativeBatch(

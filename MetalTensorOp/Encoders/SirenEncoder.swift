@@ -9,6 +9,13 @@ enum SirenEncoderError: Error {
 }
 
 final class SirenEncoder: ComputeEncoder {
+    private struct RenderUniforms {
+        var time: Float
+        var trainingWidth: UInt32
+        var trainingHeight: UInt32
+        var padding: UInt32 = 0
+    }
+
     let pipelineState: MTLComputePipelineState
     let cooperativePipelineState: MTLComputePipelineState
     let cooperativeBufferPipelineState: MTLComputePipelineState
@@ -16,7 +23,7 @@ final class SirenEncoder: ComputeEncoder {
     var bufferArgumentTable: any MTL4ArgumentTable
     let residencySet: MTLResidencySet
     private let mlp: MLP
-    private var timeBuffer: MTLBuffer
+    private let renderUniformsBuffer: MTLBuffer
     private let tensorArgumentsBuffer: MTLBuffer
     private let layerCountBuffer: MTLBuffer
     private let numSamplesBuffer: MTLBuffer
@@ -49,7 +56,7 @@ final class SirenEncoder: ComputeEncoder {
                 
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
-        tableDesc.maxBufferBindCount = 3
+        tableDesc.maxBufferBindCount = 4
         
         let fileName = "siren"
         
@@ -91,10 +98,20 @@ final class SirenEncoder: ComputeEncoder {
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
         self.layerCountBuffer = layerCountBuffer
 
-        guard let timeBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared) else {
+        let trainingWidth = UInt32(sirenModel.metadata?.image?.width ?? 0)
+        let trainingHeight = UInt32(sirenModel.metadata?.image?.height ?? 0)
+
+        guard let renderUniformsBuffer = device.makeBuffer(length: MemoryLayout<RenderUniforms>.stride, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer
         }
-        self.timeBuffer = timeBuffer
+        var uniforms = RenderUniforms(
+            time: 0,
+            trainingWidth: trainingWidth,
+            trainingHeight: trainingHeight,
+            padding: 0
+        )
+        memcpy(renderUniformsBuffer.contents(), &uniforms, MemoryLayout<RenderUniforms>.stride)
+        self.renderUniformsBuffer = renderUniformsBuffer
 
         guard let numSamplesBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer
@@ -103,7 +120,7 @@ final class SirenEncoder: ComputeEncoder {
 
         self.argumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
         self.argumentTable.setAddress(layerCountBuffer.gpuAddress, index: 1)
-        self.argumentTable.setAddress(timeBuffer.gpuAddress, index: 2)
+        self.argumentTable.setAddress(renderUniformsBuffer.gpuAddress, index: 2)
 
         let bufferTableDesc = MTL4ArgumentTableDescriptor()
         bufferTableDesc.maxBufferBindCount = 5
@@ -130,7 +147,7 @@ final class SirenEncoder: ComputeEncoder {
 
         residency.addAllocation(layerCountBuffer)
         residency.addAllocation(tensorArgumentsBuffer)
-        residency.addAllocation(timeBuffer)
+        residency.addAllocation(renderUniformsBuffer)
         residency.addAllocation(numSamplesBuffer)
 
         residency.commit()
@@ -145,8 +162,10 @@ final class SirenEncoder: ComputeEncoder {
     }
 
     func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer, mode: RenderMode) {
-        var t = Float(CACurrentMediaTime())
-        memcpy(timeBuffer.contents(), &t, MemoryLayout<Float>.size)
+        let uniformsPointer = renderUniformsBuffer
+            .contents()
+            .bindMemory(to: RenderUniforms.self, capacity: 1)
+        uniformsPointer.pointee.time = Float(CACurrentMediaTime())
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
 
