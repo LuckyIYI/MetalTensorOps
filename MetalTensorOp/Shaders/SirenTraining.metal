@@ -2,13 +2,14 @@
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_numeric>
+#include <metal_simdgroup>
 #include <metal_atomic>
 #include "MLPCommon.metal"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-constant uint SIREN_TRAIN_BATCH_SIZE = 32;
+constant uint SIREN_TRAIN_BATCH_SIZE = 16;
 constant uint SIREN_TRAIN_MAX_DIM = 64;
 constant uint SIREN_TRAIN_OUTPUT_DIM = 3;
 constant uint SIREN_TRAIN_INPUT_DIM = 2;
@@ -16,10 +17,16 @@ constant uint SIREN_TRAIN_THREADS = 128; // matches dispatch configuration (thre
 
 struct SirenTrainingParams {
     uint batchStart;
-    uint totalSamples;
-    uint sliceBatchSize;
-    uint layerCount;
-    uint globalBatchSize;
+   uint totalSamples;
+   uint sliceBatchSize;
+   uint layerCount;
+   uint globalBatchSize;
+   uint useSampleIndices;
+    uint chunkOffset;
+    uint chunkCount;
+    uint totalWeightCount;
+    uint totalBiasCount;
+    uint chunkCapacity;
 };
 
 struct SirenAdamParams {
@@ -33,7 +40,14 @@ struct SirenAdamParams {
     float beta1Denom;
     float beta2Denom;
     float weightDecay;
-    uint preserveGradients;
+};
+
+struct SirenChunkReduceParams {
+    uint chunkCount;
+    uint layerCount;
+    uint totalWeightCount;
+    uint totalBiasCount;
+    uint chunkCapacity;
 };
 
 static_assert(SIREN_TRAIN_BATCH_SIZE <= 64, "Training batch size exceeds supported maximum for threadgroup storage");
@@ -67,6 +81,11 @@ kernel void sirenTrainStep(
     device half *activationHistory                 [[buffer(7)]],
     device half *preActivationHistory              [[buffer(8)]],
     device float *lossBuffer                       [[buffer(9)]],
+    device const uint *sampleIndices               [[buffer(10)]],
+    device float *chunkWeightGradients             [[buffer(11)]],
+    device float *chunkBiasGradients               [[buffer(12)]],
+    constant uint *layerWeightOffsets              [[buffer(13)]],
+    constant uint *layerBiasOffsets                [[buffer(14)]],
     uint3 threadgroupPosInGrid                     [[threadgroup_position_in_grid]],
     ushort threadsPerSimdgroup                     [[threads_per_simdgroup]],
     ushort3 threadsPerThreadgroup                  [[threads_per_threadgroup]],
@@ -93,6 +112,8 @@ kernel void sirenTrainStep(
     }
     const uint chunkSize = min((uint)SIREN_TRAIN_BATCH_SIZE, sliceBatch - chunkBase);
     const uint targetBase = params.batchStart + chunkBase;
+    const bool useSampleIndices = params.useSampleIndices != 0;
+    const uint globalChunkIndex = params.chunkOffset + chunkIndex;
 
     const uint layerStride = SIREN_TRAIN_BATCH_SIZE * SIREN_TRAIN_MAX_DIM;
     const uint activationChunkStride = (params.layerCount + 1) * layerStride;
@@ -130,8 +151,12 @@ kernel void sirenTrainStep(
     threadgroup half *nextActivation = activationB;
 
     for (uint localSample = linearThreadId; localSample < chunkSize; localSample += threadgroupSize) {
-        const uint sampleIndex = targetBase + localSample;
-        float2 xy = positions[sampleIndex];
+        const uint logicalIndex = targetBase + localSample;
+        uint datasetIndex = logicalIndex;
+        if (useSampleIndices) {
+            datasetIndex = sampleIndices[logicalIndex];
+        }
+        float2 xy = positions[datasetIndex];
         const uint base = localSample * currentWidth;
         currentActivation[base + 0] = half(xy.x);
         currentActivation[base + 1] = half(xy.y);
@@ -189,7 +214,6 @@ kernel void sirenTrainStep(
             auto layerBiases = mlpLayers.biases[layerIndex];
 
             const uint outputDim = layerOutputDims[layerIndex];
-            const uint inputDim = layerInputDims[layerIndex];
             const bool isLastLayer = (layerIndex == params.layerCount - 1);
             const float omega = (layerIndex == 0) ? 30.0f : 1.0f;
 
@@ -281,7 +305,12 @@ kernel void sirenTrainStep(
         for (uint sample = linearThreadId; sample < chunkSize; sample += threadgroupSize) {
             const uint computeBase = sample * currentWidth;
             const uint sampleOffset = sample * SIREN_TRAIN_MAX_DIM;
-            const float3 target = targets[targetBase + sample];
+            const uint logicalIndex = targetBase + sample;
+            uint datasetIndex = logicalIndex;
+            if (useSampleIndices) {
+                datasetIndex = sampleIndices[logicalIndex];
+            }
+            const float3 target = targets[datasetIndex];
 
             float3 prediction = float3(0.0f);
             for (uint c = 0; c < SIREN_TRAIN_OUTPUT_DIM; ++c) {
@@ -331,31 +360,67 @@ kernel void sirenTrainStep(
             const uint inputDim = layerInputDims[layerIndex];
             const uint prevActivationBase = activationIndex(uint(layerIndex), 0, 0, chunkIndex, layerStride, activationChunkStride);
 
-            for (uint idx = linearThreadId; idx < outputDim * inputDim; idx += threadgroupSize) {
-                const uint row = idx / inputDim;
-                const uint col = idx % inputDim;
+            const uint chunkCapacity = max(params.chunkCapacity, 1u);
+            if (params.chunkCount == 0) {
+                continue;
+            }
 
-                float gradSum = 0.0f;
-                for (uint sample = 0; sample < chunkSize; ++sample) {
-                    const uint sampleOffset = sample * SIREN_TRAIN_MAX_DIM;
-                    float deltaVal = float(currentDelta[sampleOffset + row]);
-                    float actVal = float(activationHistory[prevActivationBase + sampleOffset + col]);
-                    gradSum += deltaVal * actVal;
+            constexpr auto gradDescriptor = matmul2d_descriptor(
+                SIREN_TRAIN_MAX_DIM,
+                SIREN_TRAIN_MAX_DIM,
+                dynamic_length_v<int>,
+                true,
+                false,
+                false,
+                matmul2d_descriptor::mode::multiply
+            );
+
+            matmul2d<gradDescriptor, execution_simdgroups<4>> gradMatmul;
+
+            auto activationTensor = tensor(activationHistory + prevActivationBase, dextents<int, 2>(int(SIREN_TRAIN_MAX_DIM), int(SIREN_TRAIN_BATCH_SIZE)));
+            auto deltaTensor = tensor(currentDelta, dextents<int, 2>(int(SIREN_TRAIN_MAX_DIM), int(SIREN_TRAIN_BATCH_SIZE)));
+            auto coopTensor = gradMatmul.get_destination_cooperative_tensor<decltype(activationTensor), decltype(deltaTensor), float>();
+
+            const uint capacity = coopTensor.get_capacity();
+            for (uint idx = 0; idx < capacity; ++idx) {
+                if (coopTensor.is_valid_element(idx)) {
+                    coopTensor.set(idx, half(0.0f));
                 }
-                float contribution = gradSum * invGlobalBatch;
-                device atomic_float *gradPtr = reinterpret_cast<device atomic_float *>(&gWeights[row, col]);
-                atomic_fetch_add_explicit(gradPtr, contribution, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint idx = linearThreadId; idx < outputDim; idx += threadgroupSize) {
-                float gradBiasSum = 0.0f;
-                for (uint sample = 0; sample < chunkSize; ++sample) {
-                    gradBiasSum += float(currentDelta[sample * SIREN_TRAIN_MAX_DIM + idx]);
+            gradMatmul.run(activationTensor, deltaTensor, coopTensor);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (globalChunkIndex < chunkCapacity) {
+                const uint layerWeightStart = layerWeightOffsets[layerIndex];
+                for (uint idx = 0; idx < capacity; ++idx) {
+                    if (!coopTensor.is_valid_element(idx)) {
+                        continue;
+                    }
+                    auto coords = coopTensor.get_multidimensional_index(idx);
+                    const uint row = coords[0];
+                    const uint col = coords[1];
+                    if (row >= outputDim || col >= inputDim) {
+                        continue;
+                    }
+                    const uint weightIndex = layerWeightStart + row * inputDim + col;
+
+                    float contribution = float(coopTensor.get(idx)) * invGlobalBatch;
+                    chunkWeightGradients[weightIndex * chunkCapacity + globalChunkIndex] = contribution;
                 }
-                float contribution = gradBiasSum * invGlobalBatch;
-                device atomic_float *biasPtr = reinterpret_cast<device atomic_float *>(&gBiases[idx]);
-                atomic_fetch_add_explicit(biasPtr, contribution, memory_order_relaxed);
+            }
+
+            if (globalChunkIndex < chunkCapacity) {
+                for (uint idx = linearThreadId; idx < outputDim; idx += threadgroupSize) {
+                    float gradBiasSum = 0.0f;
+                    for (uint sample = 0; sample < chunkSize; ++sample) {
+                        gradBiasSum += float(currentDelta[sample * SIREN_TRAIN_MAX_DIM + idx]);
+                    }
+                    const uint layerBiasStart = layerBiasOffsets[layerIndex];
+                    const uint biasIndex = layerBiasStart + idx;
+                    chunkBiasGradients[biasIndex * chunkCapacity + globalChunkIndex] = gradBiasSum * invGlobalBatch;
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -459,9 +524,7 @@ kernel void sirenAdamUpdateWeights(
             float vHat = v / params.beta2Denom;
             float update = params.learningRate * (mHat / (sqrt(vHat) + params.epsilon));
             weights[row, col] = half(weightValue - update);
-            if (params.preserveGradients == 0) {
-                gWeights[row, col] = 0.0f;
-            }
+            gWeights[row, col] = 0.0f;
             return;
         }
         remaining -= layerWeights;
@@ -507,11 +570,113 @@ kernel void sirenAdamUpdateBiases(
             float vHat = v / params.beta2Denom;
             float update = params.learningRate * (mHat / (sqrt(vHat) + params.epsilon));
             layerBiases[idx] = half(biasValue - update);
-            if (params.preserveGradients == 0) {
-                gBiases[idx] = 0.0f;
-            }
+            gBiases[idx] = 0.0f;
             return;
         }
         remaining -= outputDim;
     }
+}
+
+kernel void sirenReduceChunkWeightGradients(
+    device const float *chunkGradients            [[buffer(0)]],
+    device DeviceFloatMLPLayers &gradients        [[buffer(1)]],
+    constant uint *layerInputDims                 [[buffer(2)]],
+    constant uint *layerOutputDims                [[buffer(3)]],
+    constant uint *layerWeightOffsets             [[buffer(4)]],
+    constant SirenChunkReduceParams &params       [[buffer(5)]],
+    ushort simdLaneId                             [[thread_index_in_simdgroup]],
+    ushort simdGroupId                            [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroupPosInGrid                    [[threadgroup_position_in_grid]],
+    ushort simdWidth                                [[threads_per_simdgroup]],
+    uint3 threadsPerThreadgroup                   [[threads_per_threadgroup]])
+{
+    if (params.chunkCount == 0 || params.totalWeightCount == 0) {
+        return;
+    }
+
+    const uint gradientsPerThreadgroup = max(threadsPerThreadgroup.x / simdWidth, 1u);
+    const uint gradientIndex = threadgroupPosInGrid.x * gradientsPerThreadgroup + uint(simdGroupId);
+    if (gradientIndex >= params.totalWeightCount) {
+        return;
+    }
+
+    const uint chunkCapacity = max(params.chunkCapacity, 1u);
+    const uint spanBase = gradientIndex * chunkCapacity;
+    float threadAccum = 0.0f;
+    for (uint chunk = uint(simdLaneId); chunk < params.chunkCount; chunk += simdWidth) {
+        threadAccum += chunkGradients[spanBase + chunk];
+    }
+    const float accum = simd_sum(threadAccum);
+    if (simdLaneId != 0) {
+        return;
+    }
+
+    uint layerIndex = params.layerCount - 1;
+    for (uint layer = 0; layer < params.layerCount; ++layer) {
+        const uint start = layerWeightOffsets[layer];
+        const uint end = layerWeightOffsets[layer + 1];
+        if (gradientIndex >= start && gradientIndex < end) {
+            layerIndex = layer;
+            break;
+        }
+    }
+
+    const uint layerStart = layerWeightOffsets[layerIndex];
+    const uint localIndex = gradientIndex - layerStart;
+    const uint inputDim = layerInputDims[layerIndex];
+    const uint row = localIndex / inputDim;
+    const uint col = localIndex % inputDim;
+
+    const float previous = gradients.weights[layerIndex][row, col];
+    gradients.weights[layerIndex][row, col] = previous + accum;
+}
+
+kernel void sirenReduceChunkBiasGradients(
+    device const float *chunkGradients            [[buffer(0)]],
+    device DeviceFloatMLPLayers &gradients        [[buffer(1)]],
+    constant uint *layerInputDims                 [[buffer(2)]],
+    constant uint *layerOutputDims                [[buffer(3)]],
+    constant uint *layerBiasOffsets               [[buffer(4)]],
+    constant SirenChunkReduceParams &params       [[buffer(5)]],
+    ushort simdLaneId                             [[thread_index_in_simdgroup]],
+    ushort simdGroupId                            [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroupPosInGrid                    [[threadgroup_position_in_grid]],
+    uint3 threadsPerThreadgroup                   [[threads_per_threadgroup]])
+{
+    const uint simdWidth = 32;
+    if (params.chunkCount == 0 || params.totalBiasCount == 0) {
+        return;
+    }
+
+    const uint gradientsPerThreadgroup = max(threadsPerThreadgroup.x / simdWidth, 1u);
+    const uint gradientIndex = threadgroupPosInGrid.x * gradientsPerThreadgroup + uint(simdGroupId);
+    if (gradientIndex >= params.totalBiasCount) {
+        return;
+    }
+
+    const uint chunkCapacity = max(params.chunkCapacity, 1u);
+    const uint spanBase = gradientIndex * chunkCapacity;
+    float threadAccum = 0.0f;
+    for (uint chunk = uint(simdLaneId); chunk < params.chunkCount; chunk += simdWidth) {
+        threadAccum += chunkGradients[spanBase + chunk];
+    }
+    const float accum = simd_sum(threadAccum);
+    if (simdLaneId != 0) {
+        return;
+    }
+
+    uint layerIndex = params.layerCount - 1;
+    for (uint layer = 0; layer < params.layerCount; ++layer) {
+        const uint start = layerBiasOffsets[layer];
+        const uint end = layerBiasOffsets[layer + 1];
+        if (gradientIndex >= start && gradientIndex < end) {
+            layerIndex = layer;
+            break;
+        }
+    }
+
+    const uint layerStart = layerBiasOffsets[layerIndex];
+    const uint localIndex = gradientIndex - layerStart;
+    const float previous = gradients.biases[layerIndex][localIndex];
+    gradients.biases[layerIndex][localIndex] = previous + accum;
 }

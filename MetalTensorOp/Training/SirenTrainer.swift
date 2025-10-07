@@ -3,11 +3,11 @@ import Metal
 import MetalKit
 import simd
 
-private let sirenTrainBatchSize = 32
+private let sirenTrainBatchSize = 16
 private let sirenTrainMaxDim = 64
 private let sirenTrainInputDim = 2
 private let sirenTrainOutputDim = 3
-private let sirenTrainMaxChunks = 64 // Supports up to 2048-sample batches
+private let sirenTrainMaxChunks = 64
 
 struct SirenTrainingParamsUniform {
     var batchStart: UInt32
@@ -15,6 +15,12 @@ struct SirenTrainingParamsUniform {
     var sliceBatchSize: UInt32
     var layerCount: UInt32
     var globalBatchSize: UInt32
+    var useSampleIndices: UInt32
+    var chunkOffset: UInt32
+    var chunkCount: UInt32
+    var totalWeightCount: UInt32
+    var totalBiasCount: UInt32
+    var chunkCapacity: UInt32
 }
 
 struct SirenAdamParamsUniform {
@@ -28,8 +34,14 @@ struct SirenAdamParamsUniform {
     var beta1Denom: Float
     var beta2Denom: Float
     var weightDecay: Float
-    var preserveGradients: UInt32
-    var padding: UInt32 = 0
+}
+
+struct SirenChunkReduceParamsUniform {
+    var chunkCount: UInt32
+    var layerCount: UInt32
+    var totalWeightCount: UInt32
+    var totalBiasCount: UInt32
+    var chunkCapacity: UInt32
 }
 
 private struct TrainingFrameResources {
@@ -50,6 +62,11 @@ private struct EvaluationResources {
 }
 
 final class SirenTrainingEngine {
+    enum SamplingMode {
+        case sequential
+        case randomWithReplacement
+    }
+
     struct HyperParameters {
         var learningRate: Float = 1e-3
         var beta1: Float = 0.9
@@ -82,9 +99,13 @@ final class SirenTrainingEngine {
     let evalPipeline: MTLComputePipelineState
     let reducePsnrPipeline: MTLComputePipelineState
     let packOutputsPipeline: MTLComputePipelineState
+    let chunkReduceWeightsPipeline: MTLComputePipelineState
+    let chunkReduceBiasesPipeline: MTLComputePipelineState
     let evalArgumentTable: any MTL4ArgumentTable
     let packArgumentTable: any MTL4ArgumentTable
     let reduceArgumentTable: any MTL4ArgumentTable
+    let chunkReduceWeightsArgumentTable: any MTL4ArgumentTable
+    let chunkReduceBiasesArgumentTable: any MTL4ArgumentTable
 
     private(set) var mlp: MLP
     let sirenEncoder: SirenEncoder
@@ -106,6 +127,11 @@ final class SirenTrainingEngine {
     private let momentBuffers1: [MTLBuffer]
     private let momentBuffers2: [MTLBuffer]
     private let adamParamsBuffer: MTLBuffer
+    private let chunkGradientWeightsBuffer: MTLBuffer
+    private let chunkGradientBiasesBuffer: MTLBuffer
+    private let layerWeightOffsetsBuffer: MTLBuffer
+    private let layerBiasOffsetsBuffer: MTLBuffer
+    private let chunkReduceParamsBuffer: MTLBuffer
     private let totalWeightCount: Int
     private let totalBiasCount: Int
 
@@ -118,6 +144,7 @@ final class SirenTrainingEngine {
     private var pendingLoss: [PendingLoss?]
     private(set) var positionsBuffer: MTLBuffer?
     private(set) var targetsBuffer: MTLBuffer?
+    private var sampleIndexBuffer: MTLBuffer?
 
     private var totalSamples: Int = 0
     private var batchCursor: Int = 0
@@ -131,7 +158,9 @@ final class SirenTrainingEngine {
     private var hostTargets: [SIMD3<Float>] = []
     private var needsHostShuffle = false
     private var trainingBatchSampleCount: Int = 1024
-
+    private var samplingMode: SamplingMode = .sequential
+    private var randomSampleIndices: [UInt32] = []
+    private var randomRNG = SystemRandomNumberGenerator()
     init(
         device: MTLDevice,
         library: MTLLibrary,
@@ -173,7 +202,7 @@ final class SirenTrainingEngine {
         self.trainingPipeline = try compiler.makeComputePipelineState(descriptor: trainPipelineDescriptor)
 
         let trainingTableDesc = MTL4ArgumentTableDescriptor()
-        trainingTableDesc.maxBufferBindCount = 10
+        trainingTableDesc.maxBufferBindCount = 15
         self.trainingArgumentTable = try device.makeArgumentTable(descriptor: trainingTableDesc)
         self.trainingFence = device.makeFence()
 
@@ -213,6 +242,20 @@ final class SirenTrainingEngine {
         reduceDescriptor.computeFunctionDescriptor = reduceFunction
         self.reducePsnrPipeline = try compiler.makeComputePipelineState(descriptor: reduceDescriptor)
 
+        let chunkReduceWeightsFunction = MTL4LibraryFunctionDescriptor()
+        chunkReduceWeightsFunction.name = "sirenReduceChunkWeightGradients"
+        chunkReduceWeightsFunction.library = library
+        let chunkReduceWeightsDescriptor = MTL4ComputePipelineDescriptor()
+        chunkReduceWeightsDescriptor.computeFunctionDescriptor = chunkReduceWeightsFunction
+        self.chunkReduceWeightsPipeline = try compiler.makeComputePipelineState(descriptor: chunkReduceWeightsDescriptor)
+
+        let chunkReduceBiasesFunction = MTL4LibraryFunctionDescriptor()
+        chunkReduceBiasesFunction.name = "sirenReduceChunkBiasGradients"
+        chunkReduceBiasesFunction.library = library
+        let chunkReduceBiasesDescriptor = MTL4ComputePipelineDescriptor()
+        chunkReduceBiasesDescriptor.computeFunctionDescriptor = chunkReduceBiasesFunction
+        self.chunkReduceBiasesPipeline = try compiler.makeComputePipelineState(descriptor: chunkReduceBiasesDescriptor)
+
         let packFunction = MTL4LibraryFunctionDescriptor()
         packFunction.name = "sirenPackOutputsRGBA"
         packFunction.library = library
@@ -234,6 +277,14 @@ final class SirenTrainingEngine {
         reduceTableDesc.maxBufferBindCount = 3
         self.reduceArgumentTable = try device.makeArgumentTable(descriptor: reduceTableDesc)
 
+        let chunkReduceWeightsTableDesc = MTL4ArgumentTableDescriptor()
+        chunkReduceWeightsTableDesc.maxBufferBindCount = 6
+        self.chunkReduceWeightsArgumentTable = try device.makeArgumentTable(descriptor: chunkReduceWeightsTableDesc)
+
+        let chunkReduceBiasesTableDesc = MTL4ArgumentTableDescriptor()
+        chunkReduceBiasesTableDesc.maxBufferBindCount = 6
+        self.chunkReduceBiasesArgumentTable = try device.makeArgumentTable(descriptor: chunkReduceBiasesTableDesc)
+
         let adamTableDesc = MTL4ArgumentTableDescriptor()
         adamTableDesc.maxBufferBindCount = 7
         self.adamArgumentTable = try device.makeArgumentTable(descriptor: adamTableDesc)
@@ -254,10 +305,41 @@ final class SirenTrainingEngine {
             return partial + dims[0]
         }
 
+        guard let chunkGradientWeightsBuffer = device.makeBuffer(length: max(1, sirenTrainMaxChunks * max(totalWeightCount, 1) * MemoryLayout<Float>.stride), options: .storageModeShared),
+              let chunkGradientBiasesBuffer = device.makeBuffer(length: max(1, sirenTrainMaxChunks * max(totalBiasCount, 1) * MemoryLayout<Float>.stride), options: .storageModeShared),
+              let layerWeightOffsetsBuffer = SirenTrainingEngine.makeLayerOffsetsBuffer(device: device, mlp: mlp, isWeight: true),
+              let layerBiasOffsetsBuffer = SirenTrainingEngine.makeLayerOffsetsBuffer(device: device, mlp: mlp, isWeight: false),
+              let chunkReduceParamsBuffer = device.makeBuffer(length: MemoryLayout<SirenChunkReduceParamsUniform>.stride, options: .storageModeShared) else {
+            throw SirenEncoderError.failedToCreateBuffer
+        }
+        self.chunkGradientWeightsBuffer = chunkGradientWeightsBuffer
+        self.chunkGradientBiasesBuffer = chunkGradientBiasesBuffer
+        self.layerWeightOffsetsBuffer = layerWeightOffsetsBuffer
+        self.layerBiasOffsetsBuffer = layerBiasOffsetsBuffer
+        self.chunkReduceParamsBuffer = chunkReduceParamsBuffer
+
         trainingArgumentTable.setAddress(sirenEncoder.tensorArgumentsBuffer.gpuAddress, index: 0)
         trainingArgumentTable.setAddress(gradientArgumentsBuffer.gpuAddress, index: 1)
         trainingArgumentTable.setAddress(layerInputDimsBuffer.gpuAddress, index: 5)
         trainingArgumentTable.setAddress(layerOutputDimsBuffer.gpuAddress, index: 6)
+        trainingArgumentTable.setAddress(chunkGradientWeightsBuffer.gpuAddress, index: 11)
+        trainingArgumentTable.setAddress(chunkGradientBiasesBuffer.gpuAddress, index: 12)
+        trainingArgumentTable.setAddress(layerWeightOffsetsBuffer.gpuAddress, index: 13)
+        trainingArgumentTable.setAddress(layerBiasOffsetsBuffer.gpuAddress, index: 14)
+
+        chunkReduceWeightsArgumentTable.setAddress(chunkGradientWeightsBuffer.gpuAddress, index: 0)
+        chunkReduceWeightsArgumentTable.setAddress(gradientArgumentsBuffer.gpuAddress, index: 1)
+        chunkReduceWeightsArgumentTable.setAddress(layerInputDimsBuffer.gpuAddress, index: 2)
+        chunkReduceWeightsArgumentTable.setAddress(layerOutputDimsBuffer.gpuAddress, index: 3)
+        chunkReduceWeightsArgumentTable.setAddress(layerWeightOffsetsBuffer.gpuAddress, index: 4)
+        chunkReduceWeightsArgumentTable.setAddress(chunkReduceParamsBuffer.gpuAddress, index: 5)
+
+        chunkReduceBiasesArgumentTable.setAddress(chunkGradientBiasesBuffer.gpuAddress, index: 0)
+        chunkReduceBiasesArgumentTable.setAddress(gradientArgumentsBuffer.gpuAddress, index: 1)
+        chunkReduceBiasesArgumentTable.setAddress(layerInputDimsBuffer.gpuAddress, index: 2)
+        chunkReduceBiasesArgumentTable.setAddress(layerOutputDimsBuffer.gpuAddress, index: 3)
+        chunkReduceBiasesArgumentTable.setAddress(layerBiasOffsetsBuffer.gpuAddress, index: 4)
+        chunkReduceBiasesArgumentTable.setAddress(chunkReduceParamsBuffer.gpuAddress, index: 5)
 
         adamArgumentTable.setAddress(sirenEncoder.tensorArgumentsBuffer.gpuAddress, index: 0)
         adamArgumentTable.setAddress(gradientArgumentsBuffer.gpuAddress, index: 1)
@@ -285,6 +367,11 @@ final class SirenTrainingEngine {
         residency.addAllocation(momentArgumentsBuffer1)
         residency.addAllocation(momentArgumentsBuffer2)
         residency.addAllocation(adamParamsBuffer)
+        residency.addAllocation(chunkGradientWeightsBuffer)
+        residency.addAllocation(chunkGradientBiasesBuffer)
+        residency.addAllocation(layerWeightOffsetsBuffer)
+        residency.addAllocation(layerBiasOffsetsBuffer)
+        residency.addAllocation(chunkReduceParamsBuffer)
         for frame in frameResources {
             residency.addAllocation(frame.paramsBuffer)
             residency.addAllocation(frame.lossBuffer)
@@ -332,6 +419,7 @@ final class SirenTrainingEngine {
         trainingBatchSampleCount = min(trainingBatchSampleCount, totalSamples)
 
         try ensureDatasetBuffersCapacity(sampleCount: positions.count)
+        try ensureSampleIndexBufferCapacity(sampleCount: trainingBatchSampleCount)
         uploadDatasetPrefix(totalSamples)
         shuffleDatasetIfNeeded()
 
@@ -340,6 +428,13 @@ final class SirenTrainingEngine {
         zeroMoments()
 
         try prepareEvaluationResources(sampleCount: totalSamples)
+    }
+
+    func setSamplingMode(_ mode: SamplingMode) {
+        samplingMode = mode
+        if mode == .randomWithReplacement {
+            try? ensureSampleIndexBufferCapacity(sampleCount: trainingBatchSampleCount)
+        }
     }
 
     private func ensureDatasetBuffersCapacity(sampleCount: Int) throws {
@@ -363,6 +458,22 @@ final class SirenTrainingEngine {
         }
 
         trainingResidencySet.commit()
+    }
+
+    private func ensureSampleIndexBufferCapacity(sampleCount: Int) throws {
+        guard sampleCount > 0 else { return }
+        let indexLength = sampleCount * MemoryLayout<UInt32>.stride
+        if sampleIndexBuffer == nil || sampleIndexBuffer!.length < indexLength {
+            guard let buffer = device.makeBuffer(length: indexLength, options: .storageModeShared) else {
+                throw SirenEncoderError.failedToCreateBuffer
+            }
+            sampleIndexBuffer = buffer
+            trainingResidencySet.addAllocation(buffer)
+            trainingResidencySet.commit()
+        }
+        if randomSampleIndices.count < sampleCount {
+            randomSampleIndices = Array(repeating: 0, count: sampleCount)
+        }
     }
 
     private func uploadDatasetPrefix(_ count: Int) {
@@ -412,7 +523,8 @@ final class SirenTrainingEngine {
         sirenEncoder.setNumSamples(newTotal)
         needsHostShuffle = true
         shuffleDatasetIfNeeded()
-        trainingBatchSampleCount = min(trainingBatchSampleCount, newTotal)
+        trainingBatchSampleCount = min(trainingBatchSampleCount, min(newTotal, maxChunkedBatchSize()))
+        try? ensureSampleIndexBufferCapacity(sampleCount: trainingBatchSampleCount)
         try? prepareEvaluationResources(sampleCount: newTotal)
         if originalPositions.count > newTotal {
             originalPositions = Array(originalPositions.prefix(newTotal))
@@ -426,26 +538,82 @@ final class SirenTrainingEngine {
         zeroGradientBuffers()
         shuffleDatasetIfNeeded()
 
-        let datasetRemaining = max(totalSamples - batchCursor, 0)
-        if datasetRemaining <= 0 {
-            batchCursor = 0
-            return
+        var desiredBatch = 0
+        var batchStart = 0
+        var logicalTotalSamples = totalSamples
+        var useSampleIndices = false
+
+        switch samplingMode {
+        case .sequential:
+            if batchCursor >= totalSamples {
+                batchCursor = 0
+                needsHostShuffle = true
+                shuffleDatasetIfNeeded()
+            }
+            let datasetRemaining = max(totalSamples - batchCursor, 0)
+            if datasetRemaining <= 0 {
+                return
+            }
+            desiredBatch = min(trainingBatchSampleCount, datasetRemaining)
+            if desiredBatch <= 0 {
+                return
+            }
+            batchStart = batchCursor
+            logicalTotalSamples = totalSamples
+
+        case .randomWithReplacement:
+            desiredBatch = min(trainingBatchSampleCount, totalSamples)
+            if desiredBatch <= 0 {
+                return
+            }
+            batchStart = 0
+            logicalTotalSamples = desiredBatch
+            useSampleIndices = true
+
+            do {
+                try ensureSampleIndexBufferCapacity(sampleCount: desiredBatch)
+            } catch {
+                return
+            }
+
+            guard let sampleIndexBuffer else { return }
+            let byteCount = desiredBatch * MemoryLayout<UInt32>.stride
+            randomSampleIndices.withUnsafeMutableBufferPointer { buffer in
+                if buffer.count < desiredBatch {
+                    return
+                }
+                for idx in 0..<desiredBatch {
+                    buffer[idx] = UInt32.random(in: 0..<UInt32(max(totalSamples, 1)), using: &randomRNG)
+                }
+                memcpy(sampleIndexBuffer.contents(), buffer.baseAddress!, byteCount)
+            }
         }
 
-        let desiredBatch = min(trainingBatchSampleCount, datasetRemaining)
-        if desiredBatch <= 0 {
-            return
+        let chunkSlots = min(
+            sirenTrainMaxChunks,
+            max(1, (desiredBatch + sirenTrainBatchSize - 1) / sirenTrainBatchSize)
+        )
+        if totalWeightCount > 0 {
+            memset(chunkGradientWeightsBuffer.contents(), 0, chunkGradientWeightsBuffer.length)
+        }
+        if totalBiasCount > 0 {
+            memset(chunkGradientBiasesBuffer.contents(), 0, chunkGradientBiasesBuffer.length)
         }
 
-        let batchStart = batchCursor
         let frame = frameResources[frameIndex % frameResources.count]
 
         var params = SirenTrainingParamsUniform(
             batchStart: UInt32(batchStart),
-            totalSamples: UInt32(totalSamples),
+            totalSamples: UInt32(logicalTotalSamples),
             sliceBatchSize: 0,
             layerCount: UInt32(mlp.layers.count),
-            globalBatchSize: UInt32(desiredBatch)
+            globalBatchSize: UInt32(desiredBatch),
+            useSampleIndices: useSampleIndices ? 1 : 0,
+            chunkOffset: 0,
+            chunkCount: 0,
+            totalWeightCount: UInt32(totalWeightCount),
+            totalBiasCount: UInt32(totalBiasCount),
+            chunkCapacity: UInt32(chunkSlots)
         )
         frame.lossBuffer.contents().bindMemory(to: Float.self, capacity: 1).pointee = 0
 
@@ -464,9 +632,7 @@ final class SirenTrainingEngine {
             epsilon: hyperParameters.epsilon,
             beta1Denom: Float(beta1Denom),
             beta2Denom: Float(beta2Denom),
-            weightDecay: hyperParameters.weightDecay,
-            preserveGradients: 0,
-            padding: 0
+            weightDecay: hyperParameters.weightDecay
         )
         adamParamsBuffer.contents().copyMemory(from: &adamParams, byteCount: MemoryLayout<SirenAdamParamsUniform>.stride)
 
@@ -478,18 +644,27 @@ final class SirenTrainingEngine {
         trainingArgumentTable.setAddress(frame.activationHistoryBuffer.gpuAddress, index: 7)
         trainingArgumentTable.setAddress(frame.preActivationHistoryBuffer.gpuAddress, index: 8)
         trainingArgumentTable.setAddress(frame.lossBuffer.gpuAddress, index: 9)
+        if let sampleIndexBuffer {
+            trainingArgumentTable.setAddress(sampleIndexBuffer.gpuAddress, index: 10)
+        }
 
         let maxSliceSamples = sirenTrainBatchSize * sirenTrainMaxChunks
         let threadsPerThreadgroup = MTLSize(width: trainingPipeline.threadExecutionWidth * 4, height: 1, depth: 1)
         var processedSamples = 0
+        var chunkOffsetAccum = 0
 
         while processedSamples < desiredBatch {
             let sliceCount = min(desiredBatch - processedSamples, maxSliceSamples)
-            params.batchStart = UInt32(batchStart + processedSamples)
-            params.sliceBatchSize = UInt32(sliceCount)
-            frame.paramsBuffer.contents().copyMemory(from: &params, byteCount: MemoryLayout<SirenTrainingParamsUniform>.stride)
-
             let chunkCount = max(1, (sliceCount + sirenTrainBatchSize - 1) / sirenTrainBatchSize)
+            if useSampleIndices {
+                params.batchStart = UInt32(processedSamples)
+            } else {
+                params.batchStart = UInt32(batchStart + processedSamples)
+            }
+            params.sliceBatchSize = UInt32(sliceCount)
+            params.chunkOffset = UInt32(chunkOffsetAccum)
+            params.chunkCount = UInt32(chunkCount)
+            frame.paramsBuffer.contents().copyMemory(from: &params, byteCount: MemoryLayout<SirenTrainingParamsUniform>.stride)
 
             guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
             commandBuffer.useResidencySet(trainingResidencySet)
@@ -505,6 +680,68 @@ final class SirenTrainingEngine {
             encoder.endEncoding()
 
             processedSamples += sliceCount
+            chunkOffsetAccum += chunkCount
+        }
+
+        let totalChunkCountForStep = chunkOffsetAccum
+
+        var reduceParams = SirenChunkReduceParamsUniform(
+            chunkCount: UInt32(totalChunkCountForStep),
+            layerCount: UInt32(mlp.layers.count),
+            totalWeightCount: UInt32(totalWeightCount),
+            totalBiasCount: UInt32(totalBiasCount),
+            chunkCapacity: UInt32(chunkSlots)
+        )
+        chunkReduceParamsBuffer.contents().copyMemory(from: &reduceParams, byteCount: MemoryLayout<SirenChunkReduceParamsUniform>.stride)
+
+        if totalChunkCountForStep > 0 {
+            if totalWeightCount > 0 {
+                guard let reduceWeightsEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+                commandBuffer.useResidencySet(trainingResidencySet)
+                reduceWeightsEncoder.setComputePipelineState(chunkReduceWeightsPipeline)
+                reduceWeightsEncoder.setArgumentTable(chunkReduceWeightsArgumentTable)
+                if let fence = trainingFence {
+                    reduceWeightsEncoder.waitForFence(fence, beforeEncoderStages: .dispatch)
+                }
+                let simdWidth = 32
+                var threadsPerGroup = chunkReduceWeightsPipeline.threadExecutionWidth * 4
+                let maxThreads = chunkReduceWeightsPipeline.maxTotalThreadsPerThreadgroup
+                if maxThreads > 0 {
+                    threadsPerGroup = min(threadsPerGroup, maxThreads)
+                }
+                threadsPerGroup = max((threadsPerGroup / simdWidth) * simdWidth, simdWidth)
+                let gradientsPerThreadgroup = max(threadsPerGroup / simdWidth, 1)
+                let threadgroupCount = max(1, (totalWeightCount + gradientsPerThreadgroup - 1) / gradientsPerThreadgroup)
+                reduceWeightsEncoder.dispatchThreadgroups(
+                    threadgroupsPerGrid: MTLSize(width: threadgroupCount, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+                )
+                reduceWeightsEncoder.endEncoding()
+            }
+
+            if totalBiasCount > 0 {
+                guard let reduceBiasesEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+                commandBuffer.useResidencySet(trainingResidencySet)
+                reduceBiasesEncoder.setComputePipelineState(chunkReduceBiasesPipeline)
+                reduceBiasesEncoder.setArgumentTable(chunkReduceBiasesArgumentTable)
+                if let fence = trainingFence {
+                    reduceBiasesEncoder.waitForFence(fence, beforeEncoderStages: .dispatch)
+                }
+                let simdWidth = 32
+                var threadsPerGroup = chunkReduceBiasesPipeline.threadExecutionWidth * 4
+                let maxThreads = chunkReduceBiasesPipeline.maxTotalThreadsPerThreadgroup
+                if maxThreads > 0 {
+                    threadsPerGroup = min(threadsPerGroup, maxThreads)
+                }
+                threadsPerGroup = max((threadsPerGroup / simdWidth) * simdWidth, simdWidth)
+                let gradientsPerThreadgroup = max(threadsPerGroup / simdWidth, 1)
+                let threadgroupCount = max(1, (totalBiasCount + gradientsPerThreadgroup - 1) / gradientsPerThreadgroup)
+                reduceBiasesEncoder.dispatchThreadgroups(
+                    threadgroupsPerGrid: MTLSize(width: threadgroupCount, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+                )
+                reduceBiasesEncoder.endEncoding()
+            }
         }
 
         if totalWeightCount > 0 {
@@ -553,10 +790,15 @@ final class SirenTrainingEngine {
 
 
         step += 1
-        batchCursor += desiredBatch
-        if batchCursor >= totalSamples {
-            batchCursor = 0
-            needsHostShuffle = true
+        switch samplingMode {
+        case .sequential:
+            batchCursor += desiredBatch
+            if batchCursor >= totalSamples {
+                batchCursor = 0
+                needsHostShuffle = true
+            }
+        case .randomWithReplacement:
+            break
         }
     }
 
@@ -569,7 +811,13 @@ final class SirenTrainingEngine {
     }
 
     func setTrainingBatchSampleCount(_ count: Int) {
-        trainingBatchSampleCount = max(sirenTrainBatchSize, count)
+        let chunkLimited = maxChunkedBatchSize()
+        let maxSamples = min(max(totalSamples, sirenTrainBatchSize), chunkLimited)
+        trainingBatchSampleCount = max(sirenTrainBatchSize, min(count, maxSamples))
+        if count > chunkLimited {
+            print("[SirenTrainingEngine] Clamping training batch to chunked capacity \(chunkLimited)")
+        }
+        try? ensureSampleIndexBufferCapacity(sampleCount: trainingBatchSampleCount)
     }
 
     func handleCompletedFrame(_ frameIndex: Int) {
@@ -901,6 +1149,25 @@ private extension SirenTrainingEngine {
         }
 
         return (inputBuffer, outputBuffer)
+    }
+
+    static func makeLayerOffsetsBuffer(device: MTLDevice, mlp: MLP, isWeight: Bool) -> MTLBuffer? {
+        var offsets: [UInt32] = []
+        offsets.reserveCapacity(mlp.layers.count + 1)
+        var runningTotal: UInt32 = 0
+        offsets.append(runningTotal)
+        for layer in mlp.layers {
+            let dims = layer.weightTensor.dimensions.extents
+            if isWeight {
+                let weightCount = UInt32(dims[0] * dims[1])
+                runningTotal += weightCount
+            } else {
+                let biasCount = UInt32(dims[0])
+                runningTotal += biasCount
+            }
+            offsets.append(runningTotal)
+        }
+        return device.makeBuffer(bytes: offsets, length: offsets.count * MemoryLayout<UInt32>.stride, options: .storageModeShared)
     }
 
     static func makeMomentTensors(device: MTLDevice, mlp: MLP) throws -> (firstMoments: [MTLTensor], firstBuffers: [MTLBuffer], secondMoments: [MTLTensor], secondBuffers: [MTLBuffer], arguments1: MTLBuffer, arguments2: MTLBuffer) {

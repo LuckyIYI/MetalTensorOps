@@ -81,6 +81,10 @@ struct SirenModel: Codable {
 #endif
 #endif
 #if TRAINING_CLI
+enum RenderMode {
+    case perPixel
+    case cooperative
+}
 typealias SirenMetadata = Metadata
 typealias SirenModelDescriptor = ModelDescriptor
 typealias SirenModelSample = ModelSample
@@ -264,7 +268,12 @@ struct TrainSirenCLI {
             trainingEngine.limitDataset(to: limit)
         }
         let totalSamples = max(trainingEngine.datasetSampleCount(), 1)
-        trainingEngine.setTrainingBatchSampleCount(min(options.trainBatchSize, totalSamples))
+        if options.trainBatchSize > trainingEngine.maxChunkedBatchSize() {
+            print("[train_siren] Requested train batch \(options.trainBatchSize) exceeds chunk capacity; clamping to \(trainingEngine.maxChunkedBatchSize())")
+        }
+        let requestedBatch = min(options.trainBatchSize, totalSamples)
+        trainingEngine.setTrainingBatchSampleCount(requestedBatch)
+        trainingEngine.setSamplingMode(.randomWithReplacement)
 
         var datasetSampleCount = trainingEngine.datasetSampleCount()
         if datasetSampleCount == 0 {
@@ -453,7 +462,12 @@ struct TrainSirenCLI {
 
         let options = MTLCompileOptions()
         options.fastMathEnabled = false
-        return try device.makeLibrary(source: source, options: options)
+        do {
+            return try device.makeLibrary(source: source, options: options)
+        } catch {
+            fputs("Shader compilation failed: \(error)\n", stderr)
+            throw error
+        }
     }
 
     private static func evaluateModel(
