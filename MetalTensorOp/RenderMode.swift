@@ -1,4 +1,8 @@
+import Foundation
+
+#if canImport(SwiftUI) && !TRAINING_CLI
 import SwiftUI
+#endif
 
 enum RenderMode: String, CaseIterable, Identifiable, Hashable {
     case perPixel = "Per Pixel"
@@ -6,7 +10,7 @@ enum RenderMode: String, CaseIterable, Identifiable, Hashable {
 
     var id: String { rawValue }
 }
-
+#if canImport(SwiftUI) && !TRAINING_CLI
 struct RenderModeKey: EnvironmentKey {
     static let defaultValue: RenderMode = .perPixel
 }
@@ -17,3 +21,4 @@ extension EnvironmentValues {
         set { self[RenderModeKey.self] = newValue }
     }
 }
+#endif

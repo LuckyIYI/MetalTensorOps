@@ -22,22 +22,30 @@ final class SirenEncoder: ComputeEncoder {
     var argumentTable: any MTL4ArgumentTable
     var bufferArgumentTable: any MTL4ArgumentTable
     let residencySet: MTLResidencySet
-    private let mlp: MLP
-    private let renderUniformsBuffer: MTLBuffer
-    private let tensorArgumentsBuffer: MTLBuffer
-    private let layerCountBuffer: MTLBuffer
-    private let numSamplesBuffer: MTLBuffer
+    private(set) var mlp: MLP
+    let renderUniformsBuffer: MTLBuffer
+    let tensorArgumentsBuffer: MTLBuffer
+    let layerCountBuffer: MTLBuffer
+    let numSamplesBuffer: MTLBuffer
 
     private let batchSize: Int = 32
 
-    init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
+    init(
+        device: MTLDevice,
+        library: MTLLibrary,
+        compiler: MTL4Compiler,
+        queue: MTL4CommandQueue,
+        mlp: MLP,
+        metadata: Metadata?,
+        trainingDimensions: (width: Int, height: Int)? = nil
+    ) throws {
         let functionDescriptor = MTL4LibraryFunctionDescriptor()
         functionDescriptor.name = "sirenMLP"
         functionDescriptor.library = library
-        
+
         let pipelineDescriptor = MTL4ComputePipelineDescriptor()
         pipelineDescriptor.computeFunctionDescriptor = functionDescriptor
-        
+
         self.pipelineState = try compiler.makeComputePipelineState(descriptor: pipelineDescriptor)
 
         let coopFunctionDescriptor = MTL4LibraryFunctionDescriptor()
@@ -53,29 +61,12 @@ final class SirenEncoder: ComputeEncoder {
         let coopBufferPipelineDescriptor = MTL4ComputePipelineDescriptor()
         coopBufferPipelineDescriptor.computeFunctionDescriptor = coopBufferFunctionDescriptor
         self.cooperativeBufferPipelineState = try compiler.makeComputePipelineState(descriptor: coopBufferPipelineDescriptor)
-                
+
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
         tableDesc.maxBufferBindCount = 4
-        
-        let fileName = "siren"
-        
-        guard let url = Bundle.main.url(forResource: fileName, withExtension: "json") else {
-            throw SirenEncoderError.failedToLocateModelJson(fileName)
-        }
-        let data = try Data(contentsOf: url)
-        
-        let sirenModel = try JSONDecoder().decode(SirenModel.self, from: data)
-        guard let mlp = sirenModel.mlp else {
-            throw SirenEncoderError.noMLPFoundInModelFile
-        }
-        self.mlp = mlp
-        
-        self.argumentTable = try device.makeArgumentTable(descriptor: tableDesc)
 
-        let desc = MTL4ArgumentTableDescriptor()
-        desc.maxBufferBindCount = 3
-        desc.maxTextureBindCount = 1
+        self.argumentTable = try device.makeArgumentTable(descriptor: tableDesc)
 
         var mlpTensorArguments = MetalMLPTensorArguments()
         for i in 0..<mlp.layers.count {
@@ -98,8 +89,8 @@ final class SirenEncoder: ComputeEncoder {
         layerCountBuffer.contents().copyMemory(from: &layerCount32, byteCount: MemoryLayout<UInt32>.size)
         self.layerCountBuffer = layerCountBuffer
 
-        let trainingWidth = UInt32(sirenModel.metadata?.image?.width ?? 0)
-        let trainingHeight = UInt32(sirenModel.metadata?.image?.height ?? 0)
+        let trainingWidth = UInt32(trainingDimensions?.width ?? metadata?.image?.width ?? 0)
+        let trainingHeight = UInt32(trainingDimensions?.height ?? metadata?.image?.height ?? 0)
 
         guard let renderUniformsBuffer = device.makeBuffer(length: MemoryLayout<RenderUniforms>.stride, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer
@@ -116,6 +107,8 @@ final class SirenEncoder: ComputeEncoder {
         guard let numSamplesBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
             throw SirenEncoderError.failedToCreateBuffer
         }
+        var zero: UInt32 = 0
+        numSamplesBuffer.contents().copyMemory(from: &zero, byteCount: MemoryLayout<UInt32>.stride)
         self.numSamplesBuffer = numSamplesBuffer
 
         self.argumentTable.setAddress(tensorArgumentsBuffer.gpuAddress, index: 0)
@@ -135,11 +128,11 @@ final class SirenEncoder: ComputeEncoder {
         for layer in mlp.layers {
             residency.addAllocation(layer.weightTensor)
             residency.addAllocation(layer.biasTensor)
-            
+
             if let weightBuffer = layer.weightTensor as? MTLBuffer {
                 residency.addAllocation(weightBuffer)
             }
-            
+
             if let biasBuffer = layer.biasTensor as? MTLBuffer {
                 residency.addAllocation(biasBuffer)
             }
@@ -152,6 +145,23 @@ final class SirenEncoder: ComputeEncoder {
 
         residency.commit()
         self.residencySet = residency
+        self.mlp = mlp
+    }
+
+    convenience init(device: MTLDevice, library: MTLLibrary, compiler: MTL4Compiler, queue: MTL4CommandQueue) throws {
+        let fileName = "siren"
+
+        guard let url = Bundle.main.url(forResource: fileName, withExtension: "json") else {
+            throw SirenEncoderError.failedToLocateModelJson(fileName)
+        }
+        let data = try Data(contentsOf: url)
+
+        let sirenModel = try JSONDecoder().decode(SirenModel.self, from: data)
+        guard let mlp = sirenModel.mlp else {
+            throw SirenEncoderError.noMLPFoundInModelFile
+        }
+
+        try self.init(device: device, library: library, compiler: compiler, queue: queue, mlp: mlp, metadata: sirenModel.metadata)
     }
 
     func supports(_ mode: RenderMode) -> Bool {
@@ -159,6 +169,19 @@ final class SirenEncoder: ComputeEncoder {
         case .perPixel, .cooperative:
             return true
         }
+    }
+
+    func updateTrainingDimensions(width: Int, height: Int) {
+        let pointer = renderUniformsBuffer
+            .contents()
+            .bindMemory(to: RenderUniforms.self, capacity: 1)
+        pointer.pointee.trainingWidth = UInt32(max(width, 0))
+        pointer.pointee.trainingHeight = UInt32(max(height, 0))
+    }
+
+    func setNumSamples(_ count: Int) {
+        var value = UInt32(max(count, 0))
+        numSamplesBuffer.contents().copyMemory(from: &value, byteCount: MemoryLayout<UInt32>.stride)
     }
 
     func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer, mode: RenderMode) {

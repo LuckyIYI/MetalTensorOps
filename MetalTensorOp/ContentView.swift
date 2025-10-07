@@ -1,376 +1,148 @@
 import SwiftUI
-import Combine
-import Metal
-import MetalKit
+import UniformTypeIdentifiers
 
-enum ModelKind: String, CaseIterable, Hashable {
-    case siren = "Siren"
-    case fourier = "Fourier"
-    case instantNGP = "Instant NGP"
+enum AppMode: String, CaseIterable, Identifiable {
+    case training = "Training"
+    case render = "Render"
+
+    var id: String { rawValue }
 }
 
-struct ModelKindKey: EnvironmentKey {
-    static let defaultValue: ModelKind = .siren
-}
-
-extension EnvironmentValues {
-    var modelKind: ModelKind {
-        get { self[ModelKindKey.self] }
-        set { self[ModelKindKey.self] = newValue }
-    }
-}
-
-protocol ComputeEncoder {
-    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer, mode: RenderMode)
-    func supports(_ mode: RenderMode) -> Bool
-}
-
-extension ComputeEncoder {
-    func supports(_ mode: RenderMode) -> Bool {
-        mode == .perPixel
-    }
-}
-
-#if os(macOS)
-import AppKit
-#elseif os(iOS)
-import UIKit
-#endif
-
-#if os(macOS)
-struct MetalCircleView: NSViewRepresentable {
-    var coordinator: Coordinator
-
-    init(coordinator: Coordinator) {
-        self.coordinator = coordinator
-    }
-
-    func makeCoordinator() -> Coordinator { coordinator }
-
-    func makeNSView(context: Context) -> MTKView {
-        let mtkView = MTKView()
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            print("[MetalCircleView] Failed to create system default Metal device")
-            return mtkView
-        }
-        mtkView.device = device
-        mtkView.framebufferOnly = false
-        (mtkView.layer as? CAMetalLayer)?.framebufferOnly = false
-        mtkView.delegate = context.coordinator
-        mtkView.clearColor = .init(red: 1, green: 1, blue: 1, alpha: 1)
-
-        context.coordinator.setup(device: device, mtkView: mtkView)
-
-        if let width = context.coordinator.imageWidth, let height = context.coordinator.imageHeight {
-            mtkView.drawableSize = CGSize(width: width, height: height)
-        } else {
-            mtkView.drawableSize = CGSize(width: 512, height: 512)
-        }
-
-        return mtkView
-    }
-
-    func updateNSView(_ nsView: MTKView, context: Context) {}
-}
-#else
-struct MetalCircleView: UIViewRepresentable {
-    var coordinator: Coordinator
-
-    init(coordinator: Coordinator) {
-        self.coordinator = coordinator
-    }
-
-    func makeCoordinator() -> Coordinator { coordinator }
-
-    func makeUIView(context: Context) -> MTKView {
-        let mtkView = MTKView()
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            print("[MetalCircleView] Failed to create system default Metal device")
-            return mtkView
-        }
-        mtkView.device = device
-        mtkView.framebufferOnly = false
-        (mtkView.layer as? CAMetalLayer)?.framebufferOnly = false
-        mtkView.delegate = context.coordinator
-        mtkView.clearColor = .init(red: 0, green: 0, blue: 0, alpha: 1)
-        mtkView.backgroundColor = .black
-    
-        context.coordinator.setup(device: device, mtkView: mtkView)
-
-        if let width = context.coordinator.imageWidth, let height = context.coordinator.imageHeight {
-            mtkView.drawableSize = CGSize(width: width, height: height)
-        } else {
-            mtkView.drawableSize = CGSize(width: 512, height: 512)
-        }
-
-        return mtkView
-    }
-
-    func updateUIView(_ uiView: MTKView, context: Context) {}
-}
-#endif
-
-@available(macOS 26.0, iOS 16.0, *)
-class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
-    var device: MTLDevice?
-    var commandQueue: MTL4CommandQueue?
-    var commandAllocators: [MTL4CommandAllocator] = []
-    
-    var sharedEvent: MTLSharedEvent?
-    var frameNumber: UInt64 = 0
-    let maxFramesInFlight = 3
-    
-    var encoder: ComputeEncoder?
-    var commandBuffer: MTL4CommandBuffer?
-    var compiler: MTL4Compiler?
-
-    @Published var imageWidth: Int?
-    @Published var imageHeight: Int?
-    @Published var aspectRatio: CGFloat?
-
-    private var drawingEnabled = false
-
-    let modelKind: ModelKind
-    var renderMode: RenderMode
-
-    init(modelKind: ModelKind = .siren, renderMode: RenderMode = .perPixel) {
-        self.modelKind = modelKind
-        self.renderMode = renderMode
-        super.init()
-    }
-
-    struct ModelFile: Decodable {
-        struct Metadata: Decodable {
-            struct ImageMetadata: Decodable {
-                let width: Int?
-                let height: Int?
-            }
-            let image: ImageMetadata?
-        }
-        let metadata: Metadata?
-    }
-
-    func setup(device: MTLDevice, mtkView: MTKView) {
-        self.device = device
-
-        guard let commandQueue = device.makeMTL4CommandQueue() else {
-            print("[Coordinator] Failed to create MTL4CommandQueue")
-            drawingEnabled = false
-            return
-        }
-        self.commandQueue = commandQueue
-
-        commandAllocators = []
-        for _ in 0..<maxFramesInFlight {
-            guard let allocator = device.makeCommandAllocator() else {
-                print("[Coordinator] Failed to create MTL4CommandAllocator")
-                drawingEnabled = false
-                return
-            }
-            commandAllocators.append(allocator)
-        }
-
-        sharedEvent = device.makeSharedEvent()
-        sharedEvent?.signaledValue = 0
-
-        do {
-            compiler = try device.makeCompiler(descriptor: .init())
-        } catch {
-            print("[Coordinator] Failed to create MTL4Compiler: \(error)")
-            drawingEnabled = false
-            return
-        }
-
-        let library: MTLLibrary
-        do {
-            library = try device.makeDefaultLibrary(bundle: .main)
-        } catch {
-            print("[Coordinator] Failed to create default library: \(error)")
-            drawingEnabled = false
-            return
-        }
-
-        guard let compiler = compiler else {
-            print("[Coordinator] Compiler is nil after creation")
-            drawingEnabled = false
-            return
-        }
-
-        imageWidth = nil
-        imageHeight = nil
-        aspectRatio = nil
-
-        do {
-            switch modelKind {
-            case .siren:
-                encoder = try SirenEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
-                loadMetadata(resourceName: "siren")
-            case .fourier:
-                encoder = try FourierEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
-                loadMetadata(resourceName: "fourier")
-            case .instantNGP:
-                guard let ngpModel = loadInstantNGPModel() else {
-                    print("[Coordinator] Instant NGP weights unavailable")
-                    drawingEnabled = false
-                    return
-                }
-
-                let metalWeights = try ngpModel.makeMetalWeights(device: device)
-                let instantEncoder = try InstantNGPEncoder(
-                    device: device,
-                    library: library,
-                    compiler: compiler,
-                    queue: commandQueue,
-                    weights: metalWeights
-                )
-                if let image = ngpModel.metadata?.image,
-                   let width = image.width,
-                   let height = image.height {
-                    imageWidth = width
-                    imageHeight = height
-                    aspectRatio = CGFloat(width) / CGFloat(height)
-                }
-                encoder = instantEncoder
-            }
-        } catch {
-
-            print("[Coordinator] Failed to initialize encoder for \(modelKind): \(error)")
-            drawingEnabled = false
-            return
-        }
-
-        guard let commandBuffer = device.makeCommandBuffer() else {
-            print("[Coordinator] Failed to create MTL4CommandBuffer")
-            drawingEnabled = false
-            return
-        }
-        self.commandBuffer = commandBuffer
-
-        guard let metalLayer = mtkView.layer as? CAMetalLayer else {
-            print("[Coordinator] MTKView's layer is not a CAMetalLayer")
-            drawingEnabled = false
-            return
-        }
-
-        commandQueue.addResidencySet(metalLayer.residencySet)
-
-        if let width = imageWidth, let height = imageHeight {
-            mtkView.drawableSize = CGSize(width: width, height: height)
-        } else {
-            mtkView.drawableSize = CGSize(width: 300, height: 300)
-        }
-
-        drawingEnabled = true
-    }
-
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
-
-    func draw(in view: MTKView) {
-        guard drawingEnabled else {
-            return
-        }
-        
-        if frameNumber >= maxFramesInFlight {
-            let previousValueToWaitFor = frameNumber - UInt64(maxFramesInFlight)
-            sharedEvent?.wait(untilSignaledValue: previousValueToWaitFor, timeoutMS: 10)
-        }
-
-        guard let drawable = view.currentDrawable else {
-            print("[Coordinator] No current drawable available")
-            return
-        }
-        
-        let frameIndex = Int(frameNumber % UInt64(maxFramesInFlight))
-        let commandAllocator = commandAllocators[frameIndex]
-        commandAllocator.reset()
-
-        guard let commandBuffer = device?.makeCommandBuffer() else {
-            print("[Coordinator] Failed to create MTL4CommandBuffer in draw")
-            return
-        }
-        guard let encoder = encoder else {
-            print("[Coordinator] Encoder is nil")
-            return
-        }
-        guard let commandQueue = commandQueue else {
-            print("[Coordinator] Command queue is nil")
-            return
-        }
-
-        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
-
-        let desiredMode = renderMode
-        let actualMode = encoder.supports(desiredMode) ? desiredMode : .perPixel
-        encoder.encode(drawableTexture: drawable.texture, commandBuffer: commandBuffer, mode: actualMode)
-        commandBuffer.endCommandBuffer()
-
-        commandQueue.waitForDrawable(drawable)
-        commandQueue.commit([commandBuffer])
-        commandQueue.signalDrawable(drawable)
-        drawable.present()
-        
-        let valueToSignal = frameNumber
-        commandQueue.signalEvent(sharedEvent!, value: valueToSignal)
-        
-        frameNumber += 1
-    }
-}
-
-extension Coordinator {
-    private func loadMetadata(resourceName: String) {
-        guard let url = Bundle.main.url(forResource: resourceName, withExtension: "json") else {
-            return
-        }
-
-        guard let data = try? Data(contentsOf: url),
-              let model = try? JSONDecoder().decode(ModelFile.self, from: data),
-              let imageMeta = model.metadata?.image,
-              let width = imageMeta.width,
-              let height = imageMeta.height else {
-            return
-        }
-
-        imageWidth = width
-        imageHeight = height
-        aspectRatio = CGFloat(width) / CGFloat(height)
-    }
-
-    private func loadInstantNGPModel() -> InstantNGPModel? {
-        guard let url = Bundle.main.url(forResource: "instant_ngp", withExtension: "json") else {
-            print("[Coordinator] instant_ngp.json not found in bundle")
-            return nil
-        }
-
-        do {
-            return try InstantNGPModel.load(from: url)
-        } catch {
-            print("[Coordinator] Failed to load Instant NGP weights: \(error)")
-            return nil
-        }
-    }
-}
-
-@available(macOS 26.0, iOS 16.0, *)
 struct ContentView: View {
-    @Environment(\.modelKind) private var modelKind
-    @Environment(\.renderMode) private var renderMode
+    @StateObject private var trainingCoordinator = SirenTrainingCoordinator()
+    @StateObject private var renderCoordinator = RenderCoordinator()
+
+    @State private var showingImporter = false
+    @State private var appMode: AppMode = .training
+    @State private var modelKind: ModelKind = .siren
+    @State private var selectedRenderMode: RenderMode = .perPixel
 
     var body: some View {
-        let coordinator = Coordinator(modelKind: modelKind, renderMode: renderMode)
-        let width = coordinator.imageWidth.map { CGFloat($0) } ?? 300
-        let height = coordinator.imageHeight.map { CGFloat($0) } ?? 300
-        
-        ZStack {
-            Color.black.ignoresSafeArea()
-            MetalCircleView(coordinator: coordinator)
-                .frame(width: width, height: height)
-                .id("\(modelKind.rawValue)|\(renderMode.rawValue)")
+        VStack(spacing: 16) {
+            modePicker
+
+            switch appMode {
+            case .training:
+                trainingControls
+                trainingPane
+            case .render:
+                renderControls
+                renderPane
+            }
         }
+        .padding(.vertical)
+        .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.image]) { result in
+            switch result {
+            case .success(let url):
+                trainingCoordinator.loadImage(url: url)
+            case .failure(let error):
+                print("[ContentView] File import error: \(error)")
+            }
+        }
+        .onAppear {
+            renderCoordinator.setModelKind(modelKind)
+            renderCoordinator.setRenderMode(selectedRenderMode)
+        }
+        .onChange(of: appMode) { mode in
+            if mode == .render {
+                renderCoordinator.setModelKind(modelKind)
+                renderCoordinator.setRenderMode(selectedRenderMode)
+            }
+        }
+        .onChange(of: modelKind) { renderCoordinator.setModelKind($0) }
+        .onChange(of: selectedRenderMode) { renderCoordinator.setRenderMode($0) }
+    }
+
+    private var modePicker: some View {
+        HStack {
+            Picker("Mode", selection: $appMode) {
+                ForEach(AppMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            Spacer()
+        }
+        .padding(.horizontal)
+    }
+
+    private var trainingControls: some View {
+        HStack {
+            Button("Load Image") { showingImporter = true }
+            Button(trainingCoordinator.isTraining ? "Pause" : "Start") {
+                trainingCoordinator.toggleTraining()
+            }
+            .disabled(trainingCoordinator.groundTruthImage == nil)
+
+            Spacer()
+
+            Text("Loss: \(trainingCoordinator.loss, format: .number.precision(.fractionLength(5)))")
+                .monospaced()
+        }
+        .padding(.horizontal)
+    }
+
+    private var trainingPane: some View {
+        HStack(spacing: 16) {
+            ZStack {
+                Color.black
+                if let image = trainingCoordinator.groundTruthImage {
+                    Image(decorative: image, scale: 1.0)
+                        .resizable()
+                        .aspectRatio(trainingCoordinator.aspectRatio, contentMode: .fit)
+                } else {
+                    Text("Ground Truth")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            ZStack {
+                Color.black
+                SirenTrainingMetalView(coordinator: trainingCoordinator)
+                    .aspectRatio(trainingCoordinator.aspectRatio, contentMode: .fit)
+            }
+        }
+        .frame(minHeight: 360)
+        .padding(.horizontal)
+    }
+
+    private var renderControls: some View {
+        HStack {
+            Picker("Model", selection: $modelKind) {
+                ForEach(ModelKind.allCases) { model in
+                    Text(model.rawValue).tag(model)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Picker("Render Mode", selection: $selectedRenderMode) {
+                ForEach(RenderMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 220)
+
+            Spacer()
+        }
+        .padding(.horizontal)
+    }
+
+    private var renderPane: some View {
+        ZStack {
+            Color.black
+            RenderMetalView(coordinator: renderCoordinator)
+                .aspectRatio(renderCoordinator.aspectRatio, contentMode: .fit)
+            if !renderCoordinator.isReady {
+                ProgressView()
+                    .progressViewStyle(.circular)
+            }
+        }
+        .frame(minHeight: 360)
+        .padding(.horizontal)
     }
 }
 
 #Preview {
     ContentView()
-        .environment(\.modelKind, .siren)
-        .environment(\.renderMode, .perPixel)
 }

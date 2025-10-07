@@ -301,6 +301,7 @@ struct InstantNGPModel: Codable {
     }
 }
 
+#if !TRAINING_CLI
 extension InstantNGPModel {
     static func load(from url: URL) throws -> InstantNGPModel {
         let data = try Data(contentsOf: url)
@@ -383,3 +384,4 @@ extension InstantNGPModel {
         return expanded
     }
 }
+#endif

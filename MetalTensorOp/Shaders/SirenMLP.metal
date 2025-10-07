@@ -249,6 +249,24 @@ struct SirenBufferOutputWriter {
     }
 };
 
+struct SirenEvalOutputWriter {
+    device float3 *outputs;
+    device float *diffSquares;
+    device const float3 *targets;
+
+    inline void operator()(uint sampleIndex, uint localIdx, threadgroup half *outputStorage) const {
+        float3 rgb;
+        rgb.x = float(outputStorage[localIdx * OUTPUT_DIM + 0]);
+        rgb.y = float(outputStorage[localIdx * OUTPUT_DIM + 1]);
+        rgb.z = float(outputStorage[localIdx * OUTPUT_DIM + 2]);
+        outputs[sampleIndex] = rgb;
+
+        float3 target = targets[sampleIndex];
+        float3 diff = rgb - target;
+        diffSquares[sampleIndex] = dot(diff, diff);
+    }
+};
+
 kernel void sirenMLP(
     texture2d<float, access::write> outTexture [[texture(0)]],
     constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
@@ -449,4 +467,107 @@ kernel void sirenMLPCoopBuffer(
         outputStorage,
         sampleMask
     );
+}
+
+kernel void sirenEvalCoopBuffer(
+    constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
+    constant uint &mlpLayerCount [[buffer(1)]],
+    device const float2 *positions [[buffer(2)]],
+    device const float3 *targets [[buffer(3)]],
+    device float3 *outputs [[buffer(4)]],
+    device float *diffSquares [[buffer(5)]],
+    constant uint &numSamples [[buffer(6)]],
+    uint3 threadgroupPositionInGrid [[threadgroup_position_in_grid]],
+    ushort threadsPerSimdgroup [[threads_per_simdgroup]],
+    ushort3 threadsPerThreadgroup [[threads_per_threadgroup]],
+    ushort simdLaneId [[thread_index_in_simdgroup]],
+    ushort simdGroupId [[simdgroup_index_in_threadgroup]])
+{
+    const uint threadgroupSize =
+        uint(threadsPerThreadgroup.x) * uint(threadsPerThreadgroup.y) * uint(threadsPerThreadgroup.z);
+    const uint linearThreadId = uint(simdGroupId) * uint(threadsPerSimdgroup) + uint(simdLaneId);
+
+    const uint batchStart = threadgroupPositionInGrid.x * SIREN_BATCH_SIZE;
+    if (batchStart >= numSamples) {
+        return;
+    }
+
+    const uint remaining = numSamples - batchStart;
+    const uint actualBatch = remaining < SIREN_BATCH_SIZE ? remaining : (uint)SIREN_BATCH_SIZE;
+
+    threadgroup half activationA[SIREN_BATCH_SIZE * SIREN_MAX_DIM];
+    threadgroup half activationB[SIREN_BATCH_SIZE * SIREN_MAX_DIM];
+    threadgroup float accumStorage[SIREN_BATCH_SIZE * SIREN_MAX_DIM];
+    threadgroup half outputStorage[SIREN_BATCH_SIZE * OUTPUT_DIM];
+    threadgroup uchar sampleMask[SIREN_BATCH_SIZE];
+
+    SirenBufferInputLoader loader{positions};
+    SirenEvalOutputWriter writer{outputs, diffSquares, targets};
+
+    sirenRunCooperativeBatch(
+        mlpLayers,
+        mlpLayerCount,
+        loader,
+        writer,
+        batchStart,
+        actualBatch,
+        linearThreadId,
+        threadgroupSize,
+        activationA,
+        activationB,
+        accumStorage,
+        outputStorage,
+        sampleMask
+    );
+
+    for (uint idx = linearThreadId + actualBatch; idx < SIREN_BATCH_SIZE; idx += threadgroupSize) {
+        const uint sampleIndex = batchStart + idx;
+        if (sampleIndex < numSamples) {
+            diffSquares[sampleIndex] = 0.0f;
+            outputs[sampleIndex] = float3(0.0f);
+        }
+    }
+}
+
+kernel void sirenReduceDiffSquares(
+    device const float *diffSquares [[buffer(0)]],
+    device float *result [[buffer(1)]],
+    constant uint &sampleCount [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid != 0) {
+        return;
+    }
+
+    float total = 0.0f;
+    for (uint i = 0; i < sampleCount; ++i) {
+        total += diffSquares[i];
+    }
+
+    float mse = total / (float(sampleCount) * 3.0f);
+    float psnr = (mse <= 0.0f) ? 1000.0f : 10.0f * log10(1.0f / mse);
+
+    result[0] = total;
+    result[1] = mse;
+    result[2] = psnr;
+}
+
+kernel void sirenPackOutputsRGBA(
+    device const float3 *outputs [[buffer(0)]],
+    device uchar4 *rgbaBytes [[buffer(1)]],
+    constant uint &sampleCount [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= sampleCount) {
+        return;
+    }
+
+    float3 rgb = outputs[gid];
+    rgb = clamp(rgb, float3(0.0f), float3(1.0f));
+    uchar4 pixel;
+    pixel.x = uchar(clamp(rgb.x * 255.0f, 0.0f, 255.0f));
+    pixel.y = uchar(clamp(rgb.y * 255.0f, 0.0f, 255.0f));
+    pixel.z = uchar(clamp(rgb.z * 255.0f, 0.0f, 255.0f));
+    pixel.w = 255;
+    rgbaBytes[gid] = pixel;
 }

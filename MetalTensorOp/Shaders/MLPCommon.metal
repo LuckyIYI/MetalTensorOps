@@ -16,6 +16,11 @@ struct DeviceMLPLayers {
     tensor<device half, dextents<int, 1>> biases[MAX_MLP_LAYERS];
 };
 
+struct DeviceFloatMLPLayers {
+    tensor<device float, dextents<int, 2>> weights[MAX_MLP_LAYERS];
+    tensor<device float, dextents<int, 1>> biases[MAX_MLP_LAYERS];
+};
+
 inline float activation_relu(float value) {
     return max(value, 0.0f);
 }

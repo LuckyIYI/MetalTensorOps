@@ -22,6 +22,11 @@ struct MLPParameterLayer: Codable {
     let weightTensor: MTLTensor
     let biasTensor: MTLTensor
 
+    init(weightTensor: MTLTensor, biasTensor: MTLTensor) {
+        self.weightTensor = weightTensor
+        self.biasTensor = biasTensor
+    }
+
     private enum CodingKeys: String, CodingKey {
         case weights
         case biases
