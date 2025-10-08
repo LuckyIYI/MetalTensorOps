@@ -239,7 +239,7 @@ kernel void sirenTrainStep(
             for (uint sample = linearThreadId; sample < chunkSize; sample += threadgroupSize) {
                 const uint computeBase = sample * outputDim;
                 const uint historyBase = activationIndex(layerIndex + 1, sample, 0, chunkIndex, layerStride, activationChunkStride);
-                float activationSum = 0.0f;
+                const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
 
                 for (uint outIdx = 0; outIdx < outputDim; ++outIdx) {
                     const uint accumIndex = outIdx + sample * outputDim;
@@ -247,20 +247,29 @@ kernel void sirenTrainStep(
                     float z = dotValue + float(layerBiases[outIdx]);
                     accumStorage[accumIndex] = z;
 
-                    float activated = isLastLayer ? activation_sigmoid(z) : sin(omega * z);
+                    float activated;
+                    if (isLastLayer) {
+                        activated = activation_sigmoid(z);
+                    } else {
+                        float cosVal;
+                        activated = sincos(omega * z, cosVal);
+                        preActivationHistory[preBase + outIdx] = half(omega * cosVal);
+                    }
+
                     nextActivation[computeBase + outIdx] = half(activated);
                     activationHistory[historyBase + outIdx] = half(activated);
-                    activationSum += activated;
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint idx = linearThreadId; idx < chunkSize * outputDim; idx += threadgroupSize) {
-                const uint sample = idx / outputDim;
-                const uint feature = idx % outputDim;
-                const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
-                const uint accumIndex = feature + sample * outputDim;
-                preActivationHistory[preBase + feature] = half(accumStorage[accumIndex]);
+            if (isLastLayer) {
+                for (uint idx = linearThreadId; idx < chunkSize * outputDim; idx += threadgroupSize) {
+                    const uint sample = idx / outputDim;
+                    const uint feature = idx % outputDim;
+                    const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
+                    const uint accumIndex = feature + sample * outputDim;
+                    preActivationHistory[preBase + feature] = half(accumStorage[accumIndex]);
+                }
             }
 
             for (uint sample = linearThreadId; sample < chunkSize; sample += threadgroupSize) {
@@ -438,10 +447,8 @@ kernel void sirenTrainStep(
                     sum += weightVal * deltaVal;
                 }
                 const uint offset = sample * SIREN_TRAIN_MAX_DIM + neuron;
-                float preAct = float(preActivationHistory[layerOffset(uint(layerIndex - 1), chunkIndex, layerStride, preActivationChunkStride) + offset]);
-                const float omega = (layerIndex - 1 == 0) ? 30.0f : 1.0f;
-                float actDerivative = omega * cos(omega * preAct);
-                float value = sum * actDerivative;
+                float derivative = float(preActivationHistory[layerOffset(uint(layerIndex - 1), chunkIndex, layerStride, preActivationChunkStride) + offset]);
+                float value = sum * derivative;
                 nextDelta[offset] = half(value);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
