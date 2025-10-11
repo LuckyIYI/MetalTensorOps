@@ -17,16 +17,19 @@ constant uint SIREN_TRAIN_THREADS = 128; // matches dispatch configuration (thre
 
 struct SirenTrainingParams {
     uint batchStart;
-   uint totalSamples;
-   uint sliceBatchSize;
-   uint layerCount;
-   uint globalBatchSize;
-   uint useSampleIndices;
+    uint totalSamples;
+    uint sliceBatchSize;
+    uint layerCount;
+    uint globalBatchSize;
+    uint useSampleIndices;
     uint chunkOffset;
     uint chunkCount;
     uint totalWeightCount;
     uint totalBiasCount;
     uint chunkCapacity;
+    uint layerStride;
+    uint activationChunkStride;
+    uint preActivationChunkStride;
 };
 
 struct SirenAdamParams {
@@ -79,13 +82,14 @@ kernel void sirenTrainStep(
     constant uint *layerInputDims                  [[buffer(5)]],
     constant uint *layerOutputDims                 [[buffer(6)]],
     device half *activationHistory                 [[buffer(7)]],
-    device half *preActivationHistory              [[buffer(8)]],
-    device float *lossBuffer                       [[buffer(9)]],
-    device const uint *sampleIndices               [[buffer(10)]],
-    device float *chunkWeightGradients             [[buffer(11)]],
-    device float *chunkBiasGradients               [[buffer(12)]],
-    constant uint *layerWeightOffsets              [[buffer(13)]],
-    constant uint *layerBiasOffsets                [[buffer(14)]],
+    device half *cosDerivativeHistory              [[buffer(8)]],
+    device half *preActivationLogits               [[buffer(9)]],
+    device float *lossBuffer                       [[buffer(10)]],
+    device const uint *sampleIndices               [[buffer(11)]],
+    device float *chunkWeightGradients             [[buffer(12)]],
+    device float *chunkBiasGradients               [[buffer(13)]],
+    constant uint *layerWeightOffsets              [[buffer(14)]],
+    constant uint *layerBiasOffsets                [[buffer(15)]],
     uint3 threadgroupPosInGrid                     [[threadgroup_position_in_grid]],
     ushort threadsPerSimdgroup                     [[threads_per_simdgroup]],
     ushort3 threadsPerThreadgroup                  [[threads_per_threadgroup]],
@@ -114,10 +118,11 @@ kernel void sirenTrainStep(
     const uint targetBase = params.batchStart + chunkBase;
     const bool useSampleIndices = params.useSampleIndices != 0;
     const uint globalChunkIndex = params.chunkOffset + chunkIndex;
+    const bool hasTail = (chunkSize < SIREN_TRAIN_BATCH_SIZE);
 
-    const uint layerStride = SIREN_TRAIN_BATCH_SIZE * SIREN_TRAIN_MAX_DIM;
-    const uint activationChunkStride = (params.layerCount + 1) * layerStride;
-    const uint preActivationChunkStride = params.layerCount * layerStride;
+    const uint layerStride = params.layerStride;
+    const uint activationChunkStride = params.activationChunkStride;
+    const uint preActivationChunkStride = params.preActivationChunkStride;
 
     threadgroup half activationA[SIREN_TRAIN_BATCH_SIZE * SIREN_TRAIN_MAX_DIM];
     threadgroup half activationB[SIREN_TRAIN_BATCH_SIZE * SIREN_TRAIN_MAX_DIM];
@@ -161,10 +166,12 @@ kernel void sirenTrainStep(
         currentActivation[base + 0] = half(xy.x);
         currentActivation[base + 1] = half(xy.y);
     }
-    for (uint localSample = linearThreadId + chunkSize; localSample < SIREN_TRAIN_BATCH_SIZE; localSample += threadgroupSize) {
-        const uint base = localSample * currentWidth;
-        currentActivation[base + 0] = half(0.0f);
-        currentActivation[base + 1] = half(0.0f);
+    if (hasTail) {
+        for (uint localSample = linearThreadId + chunkSize; localSample < SIREN_TRAIN_BATCH_SIZE; localSample += threadgroupSize) {
+            const uint base = localSample * currentWidth;
+            currentActivation[base + 0] = half(0.0f);
+            currentActivation[base + 1] = half(0.0f);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -173,6 +180,14 @@ kernel void sirenTrainStep(
         const uint feature = idx % currentWidth;
         activationHistory[activationIndex(0, sample, feature, chunkIndex, layerStride, activationChunkStride)] = currentActivation[sample * currentWidth + feature];
     }
+
+    // Pad input layer activations to prevent gradient matmul from reading stale data
+    for (uint idx = linearThreadId; idx < chunkSize * (SIREN_TRAIN_MAX_DIM - SIREN_TRAIN_INPUT_DIM); idx += threadgroupSize) {
+        const uint sample = idx / (SIREN_TRAIN_MAX_DIM - SIREN_TRAIN_INPUT_DIM);
+        const uint padding = SIREN_TRAIN_INPUT_DIM + (idx % (SIREN_TRAIN_MAX_DIM - SIREN_TRAIN_INPUT_DIM));
+        activationHistory[activationIndex(0, sample, padding, chunkIndex, layerStride, activationChunkStride)] = half(0.0f);
+    }
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
         constexpr auto firstLayerDescriptor = matmul2d_descriptor(
@@ -220,7 +235,7 @@ kernel void sirenTrainStep(
             auto inputTensor = tensor(currentActivation, dextents<int, 2>(int(currentWidth), int(SIREN_TRAIN_BATCH_SIZE)));
             auto accumTensor = tensor(accumStorage, dextents<int, 2>(int(outputDim), int(SIREN_TRAIN_BATCH_SIZE)));
 
-            if (chunkSize < SIREN_TRAIN_BATCH_SIZE) {
+            if (hasTail) {
                 for (uint idx = linearThreadId + chunkSize * currentWidth; idx < SIREN_TRAIN_BATCH_SIZE * currentWidth; idx += threadgroupSize) {
                     accumStorage[idx] = 0.0f;
                 }
@@ -253,7 +268,7 @@ kernel void sirenTrainStep(
                     } else {
                         float cosVal;
                         activated = sincos(omega * z, cosVal);
-                        preActivationHistory[preBase + outIdx] = half(omega * cosVal);
+                        cosDerivativeHistory[preBase + outIdx] = half(omega * cosVal);
                     }
 
                     nextActivation[computeBase + outIdx] = half(activated);
@@ -266,32 +281,51 @@ kernel void sirenTrainStep(
                 for (uint idx = linearThreadId; idx < chunkSize * outputDim; idx += threadgroupSize) {
                     const uint sample = idx / outputDim;
                     const uint feature = idx % outputDim;
-                    const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
+                    // preActivationLogits only allocated for final layer, use layer 0 offset
+                    const uint preBase = chunkIndex * layerStride + sample * SIREN_TRAIN_MAX_DIM;
                     const uint accumIndex = feature + sample * outputDim;
-                    preActivationHistory[preBase + feature] = half(accumStorage[accumIndex]);
+                    preActivationLogits[preBase + feature] = half(accumStorage[accumIndex]);
                 }
             }
 
-            for (uint sample = linearThreadId; sample < chunkSize; sample += threadgroupSize) {
+            // Pad within valid samples (dimension padding)
+            for (uint idx = linearThreadId; idx < chunkSize * (SIREN_TRAIN_MAX_DIM - outputDim); idx += threadgroupSize) {
+                const uint sample = idx / (SIREN_TRAIN_MAX_DIM - outputDim);
+                const uint padding = outputDim + (idx % (SIREN_TRAIN_MAX_DIM - outputDim));
                 const uint historyBase = activationIndex(layerIndex + 1, sample, 0, chunkIndex, layerStride, activationChunkStride);
-                const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
-                for (uint padding = outputDim; padding < SIREN_TRAIN_MAX_DIM; ++padding) {
-                    activationHistory[historyBase + padding] = half(0.0f);
-                    preActivationHistory[preBase + padding] = half(0.0f);
+                activationHistory[historyBase + padding] = half(0.0f);
+
+                if (!isLastLayer) {
+                    const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
+                    cosDerivativeHistory[preBase + padding] = half(0.0f);
+                } else {
+                    // preActivationLogits only allocated for final layer, use layer 0 offset
+                    const uint preBase = chunkIndex * layerStride + sample * SIREN_TRAIN_MAX_DIM;
+                    cosDerivativeHistory[layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM + padding] = half(0.0f);
+                    preActivationLogits[preBase + padding] = half(0.0f);
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint sample = linearThreadId + chunkSize; sample < SIREN_TRAIN_BATCH_SIZE; sample += threadgroupSize) {
-                const uint computeBase = sample * outputDim;
-                const uint historyBase = activationIndex(layerIndex + 1, sample, 0, chunkIndex, layerStride, activationChunkStride);
-                const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
-                for (uint feature = 0; feature < outputDim; ++feature) {
-                    nextActivation[computeBase + feature] = half(0.0f);
-                }
-                for (uint feature = 0; feature < SIREN_TRAIN_MAX_DIM; ++feature) {
+            // Pad tail samples (full padding)
+            if (hasTail) {
+                for (uint idx = linearThreadId; idx < (SIREN_TRAIN_BATCH_SIZE - chunkSize) * SIREN_TRAIN_MAX_DIM; idx += threadgroupSize) {
+                    const uint sample = chunkSize + idx / SIREN_TRAIN_MAX_DIM;
+                    const uint feature = idx % SIREN_TRAIN_MAX_DIM;
+                    if (feature < outputDim) {
+                        nextActivation[sample * outputDim + feature] = half(0.0f);
+                    }
+                    const uint historyBase = activationIndex(layerIndex + 1, sample, 0, chunkIndex, layerStride, activationChunkStride);
                     activationHistory[historyBase + feature] = half(0.0f);
-                    preActivationHistory[preBase + feature] = half(0.0f);
+
+                    if (!isLastLayer) {
+                        const uint preBase = layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM;
+                        cosDerivativeHistory[preBase + feature] = half(0.0f);
+                    } else {
+                        // preActivationLogits only allocated for final layer, use layer 0 offset
+                        const uint preBase = chunkIndex * layerStride + sample * SIREN_TRAIN_MAX_DIM;
+                        cosDerivativeHistory[layerOffset(layerIndex, chunkIndex, layerStride, preActivationChunkStride) + sample * SIREN_TRAIN_MAX_DIM + feature] = half(0.0f);
+                        preActivationLogits[preBase + feature] = half(0.0f);
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -326,14 +360,15 @@ kernel void sirenTrainStep(
                 prediction[c] = float(outputActivation[computeBase + c]);
             }
 
-            const uint lastPreBase = layerOffset(lastLayerIndex, chunkIndex, layerStride, preActivationChunkStride) + sampleOffset;
+            // preActivationLogits only allocated for final layer, use layer 0 offset
+            const uint lastPreBase = chunkIndex * layerStride + sampleOffset;
             for (uint c = 0; c < SIREN_TRAIN_OUTPUT_DIM; ++c) {
                 float activated = clamp(prediction[c], 1e-6f, 1.0f - 1e-6f);
                 float preValue = log(activated / (1.0f - activated));
-                preActivationHistory[lastPreBase + c] = half(preValue);
+                preActivationLogits[lastPreBase + c] = half(preValue);
             }
             for (uint padding = SIREN_TRAIN_OUTPUT_DIM; padding < SIREN_TRAIN_MAX_DIM; ++padding) {
-                preActivationHistory[lastPreBase + padding] = half(0.0f);
+                preActivationLogits[lastPreBase + padding] = half(0.0f);
             }
 
             float3 diff = prediction - target;
@@ -350,8 +385,10 @@ kernel void sirenTrainStep(
             }
         }
 
-        for (uint sample = linearThreadId + chunkSize; sample < SIREN_TRAIN_BATCH_SIZE; sample += threadgroupSize) {
-            for (uint feature = 0; feature < SIREN_TRAIN_MAX_DIM; ++feature) {
+        if (hasTail) {
+            for (uint idx = linearThreadId; idx < (SIREN_TRAIN_BATCH_SIZE - chunkSize) * SIREN_TRAIN_MAX_DIM; idx += threadgroupSize) {
+                const uint sample = chunkSize + idx / SIREN_TRAIN_MAX_DIM;
+                const uint feature = idx % SIREN_TRAIN_MAX_DIM;
                 deltaCurrentHalf[sample * SIREN_TRAIN_MAX_DIM + feature] = half(0.0f);
             }
         }
@@ -362,8 +399,6 @@ kernel void sirenTrainStep(
 
         for (int layerIndex = int(params.layerCount) - 1; layerIndex >= 0; --layerIndex) {
             auto weights = mlpLayers.weights[layerIndex];
-            auto gWeights = gradients.weights[layerIndex];
-            auto gBiases = gradients.biases[layerIndex];
 
             const uint outputDim = layerOutputDims[layerIndex];
             const uint inputDim = layerInputDims[layerIndex];
@@ -386,14 +421,14 @@ kernel void sirenTrainStep(
 
             matmul2d<gradDescriptor, execution_simdgroups<4>> gradMatmul;
 
-            auto activationTensor = tensor(activationHistory + prevActivationBase, dextents<int, 2>(int(SIREN_TRAIN_MAX_DIM), int(SIREN_TRAIN_BATCH_SIZE)));
-            auto deltaTensor = tensor(currentDelta, dextents<int, 2>(int(SIREN_TRAIN_MAX_DIM), int(SIREN_TRAIN_BATCH_SIZE)));
+            auto activationTensor = tensor(activationHistory + prevActivationBase, dextents<int, 2>(int(inputDim), int(SIREN_TRAIN_BATCH_SIZE)));
+            auto deltaTensor = tensor(currentDelta, dextents<int, 2>(int(outputDim), int(SIREN_TRAIN_BATCH_SIZE)));
             auto coopTensor = gradMatmul.get_destination_cooperative_tensor<decltype(activationTensor), decltype(deltaTensor), float>();
 
             const uint capacity = coopTensor.get_capacity();
             for (uint idx = 0; idx < capacity; ++idx) {
                 if (coopTensor.is_valid_element(idx)) {
-                    coopTensor.set(idx, half(0.0f));
+                    coopTensor.set(idx, 0.0f);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -410,12 +445,9 @@ kernel void sirenTrainStep(
                     auto coords = coopTensor.get_multidimensional_index(idx);
                     const uint row = coords[0];
                     const uint col = coords[1];
-                    if (row >= outputDim || col >= inputDim) {
-                        continue;
-                    }
                     const uint weightIndex = layerWeightStart + row * inputDim + col;
 
-                    float contribution = float(coopTensor.get(idx)) * invGlobalBatch;
+                    float contribution = coopTensor.get(idx) * invGlobalBatch;
                     chunkWeightGradients[weightIndex * chunkCapacity + globalChunkIndex] = contribution;
                 }
             }
@@ -447,20 +479,24 @@ kernel void sirenTrainStep(
                     sum += weightVal * deltaVal;
                 }
                 const uint offset = sample * SIREN_TRAIN_MAX_DIM + neuron;
-                float derivative = float(preActivationHistory[layerOffset(uint(layerIndex - 1), chunkIndex, layerStride, preActivationChunkStride) + offset]);
+                float derivative = float(cosDerivativeHistory[layerOffset(uint(layerIndex - 1), chunkIndex, layerStride, preActivationChunkStride) + offset]);
                 float value = sum * derivative;
                 nextDelta[offset] = half(value);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint sample = linearThreadId; sample < chunkSize; sample += threadgroupSize) {
-                for (uint neuron = inputDim; neuron < SIREN_TRAIN_MAX_DIM; ++neuron) {
-                    const uint offset = sample * SIREN_TRAIN_MAX_DIM + neuron;
-                    nextDelta[offset] = half(0.0f);
-                }
+            // Pad within valid samples (dimension padding)
+            for (uint idx = linearThreadId; idx < chunkSize * (SIREN_TRAIN_MAX_DIM - inputDim); idx += threadgroupSize) {
+                const uint sample = idx / (SIREN_TRAIN_MAX_DIM - inputDim);
+                const uint neuron = inputDim + (idx % (SIREN_TRAIN_MAX_DIM - inputDim));
+                nextDelta[sample * SIREN_TRAIN_MAX_DIM + neuron] = half(0.0f);
             }
-            for (uint sample = linearThreadId + chunkSize; sample < SIREN_TRAIN_BATCH_SIZE; sample += threadgroupSize) {
-                for (uint neuron = 0; neuron < SIREN_TRAIN_MAX_DIM; ++neuron) {
+
+            // Pad tail samples
+            if (hasTail) {
+                for (uint idx = linearThreadId; idx < (SIREN_TRAIN_BATCH_SIZE - chunkSize) * SIREN_TRAIN_MAX_DIM; idx += threadgroupSize) {
+                    const uint sample = chunkSize + idx / SIREN_TRAIN_MAX_DIM;
+                    const uint neuron = idx % SIREN_TRAIN_MAX_DIM;
                     nextDelta[sample * SIREN_TRAIN_MAX_DIM + neuron] = half(0.0f);
                 }
             }

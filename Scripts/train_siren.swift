@@ -12,12 +12,6 @@ import simd
 import MetalTensorOp
 #endif
 
-// Minimal RenderMode definition so we can reuse encoders without SwiftUI.
-enum RenderMode {
-    case perPixel
-    case cooperative
-}
-
 #if canImport(MetalTensorOp)
 typealias SirenMetadata = MetalTensorOp.Metadata
 typealias SirenModelDescriptor = MetalTensorOp.ModelDescriptor
@@ -81,10 +75,6 @@ struct SirenModel: Codable {
 #endif
 #endif
 #if TRAINING_CLI
-enum RenderMode {
-    case perPixel
-    case cooperative
-}
 typealias SirenMetadata = Metadata
 typealias SirenModelDescriptor = ModelDescriptor
 typealias SirenModelSample = ModelSample
@@ -461,7 +451,6 @@ struct TrainSirenCLI {
         let source = common + "\n" + training + "\n" + inference
 
         let options = MTLCompileOptions()
-        options.fastMathEnabled = false
         do {
             return try device.makeLibrary(source: source, options: options)
         } catch {

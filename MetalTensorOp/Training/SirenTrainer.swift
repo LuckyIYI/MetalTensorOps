@@ -9,6 +9,25 @@ private let sirenTrainInputDim = 2
 private let sirenTrainOutputDim = 3
 private let sirenTrainMaxChunks = 64
 
+private enum SirenTrainingBufferIndex: Int {
+    case mlpLayers = 0
+    case gradients = 1
+    case positions = 2
+    case targets = 3
+    case params = 4
+    case layerInputDims = 5
+    case layerOutputDims = 6
+    case activationHistory = 7
+    case cosDerivativeHistory = 8
+    case preActivationLogits = 9
+    case lossBuffer = 10
+    case sampleIndices = 11
+    case chunkWeightGradients = 12
+    case chunkBiasGradients = 13
+    case layerWeightOffsets = 14
+    case layerBiasOffsets = 15
+}
+
 struct SirenTrainingParamsUniform {
     var batchStart: UInt32
     var totalSamples: UInt32
@@ -21,6 +40,9 @@ struct SirenTrainingParamsUniform {
     var totalWeightCount: UInt32
     var totalBiasCount: UInt32
     var chunkCapacity: UInt32
+    var layerStride: UInt32
+    var activationChunkStride: UInt32
+    var preActivationChunkStride: UInt32
 }
 
 struct SirenAdamParamsUniform {
@@ -48,7 +70,8 @@ private struct TrainingFrameResources {
     let paramsBuffer: MTLBuffer
     let lossBuffer: MTLBuffer
     let activationHistoryBuffer: MTLBuffer
-    let preActivationHistoryBuffer: MTLBuffer
+    let cosDerivativeHistoryBuffer: MTLBuffer
+    let preActivationLogitsBuffer: MTLBuffer
 }
 
 private struct EvaluationResources {
@@ -158,7 +181,7 @@ final class SirenTrainingEngine {
     private var hostTargets: [SIMD3<Float>] = []
     private var needsHostShuffle = false
     private var trainingBatchSampleCount: Int = 1024
-    private var samplingMode: SamplingMode = .sequential
+    private var samplingMode: SamplingMode = .randomWithReplacement
     private var randomSampleIndices: [UInt32] = []
     private var randomRNG = SystemRandomNumberGenerator()
     init(
@@ -202,7 +225,7 @@ final class SirenTrainingEngine {
         self.trainingPipeline = try compiler.makeComputePipelineState(descriptor: trainPipelineDescriptor)
 
         let trainingTableDesc = MTL4ArgumentTableDescriptor()
-        trainingTableDesc.maxBufferBindCount = 15
+        trainingTableDesc.maxBufferBindCount = 16
         self.trainingArgumentTable = try device.makeArgumentTable(descriptor: trainingTableDesc)
         self.trainingFence = device.makeFence()
 
@@ -318,14 +341,14 @@ final class SirenTrainingEngine {
         self.layerBiasOffsetsBuffer = layerBiasOffsetsBuffer
         self.chunkReduceParamsBuffer = chunkReduceParamsBuffer
 
-        trainingArgumentTable.setAddress(sirenEncoder.tensorArgumentsBuffer.gpuAddress, index: 0)
-        trainingArgumentTable.setAddress(gradientArgumentsBuffer.gpuAddress, index: 1)
-        trainingArgumentTable.setAddress(layerInputDimsBuffer.gpuAddress, index: 5)
-        trainingArgumentTable.setAddress(layerOutputDimsBuffer.gpuAddress, index: 6)
-        trainingArgumentTable.setAddress(chunkGradientWeightsBuffer.gpuAddress, index: 11)
-        trainingArgumentTable.setAddress(chunkGradientBiasesBuffer.gpuAddress, index: 12)
-        trainingArgumentTable.setAddress(layerWeightOffsetsBuffer.gpuAddress, index: 13)
-        trainingArgumentTable.setAddress(layerBiasOffsetsBuffer.gpuAddress, index: 14)
+        trainingArgumentTable.setAddress(sirenEncoder.tensorArgumentsBuffer.gpuAddress, index: SirenTrainingBufferIndex.mlpLayers.rawValue)
+        trainingArgumentTable.setAddress(gradientArgumentsBuffer.gpuAddress, index: SirenTrainingBufferIndex.gradients.rawValue)
+        trainingArgumentTable.setAddress(layerInputDimsBuffer.gpuAddress, index: SirenTrainingBufferIndex.layerInputDims.rawValue)
+        trainingArgumentTable.setAddress(layerOutputDimsBuffer.gpuAddress, index: SirenTrainingBufferIndex.layerOutputDims.rawValue)
+        trainingArgumentTable.setAddress(chunkGradientWeightsBuffer.gpuAddress, index: SirenTrainingBufferIndex.chunkWeightGradients.rawValue)
+        trainingArgumentTable.setAddress(chunkGradientBiasesBuffer.gpuAddress, index: SirenTrainingBufferIndex.chunkBiasGradients.rawValue)
+        trainingArgumentTable.setAddress(layerWeightOffsetsBuffer.gpuAddress, index: SirenTrainingBufferIndex.layerWeightOffsets.rawValue)
+        trainingArgumentTable.setAddress(layerBiasOffsetsBuffer.gpuAddress, index: SirenTrainingBufferIndex.layerBiasOffsets.rawValue)
 
         chunkReduceWeightsArgumentTable.setAddress(chunkGradientWeightsBuffer.gpuAddress, index: 0)
         chunkReduceWeightsArgumentTable.setAddress(gradientArgumentsBuffer.gpuAddress, index: 1)
@@ -376,7 +399,8 @@ final class SirenTrainingEngine {
             residency.addAllocation(frame.paramsBuffer)
             residency.addAllocation(frame.lossBuffer)
             residency.addAllocation(frame.activationHistoryBuffer)
-            residency.addAllocation(frame.preActivationHistoryBuffer)
+            residency.addAllocation(frame.cosDerivativeHistoryBuffer)
+            residency.addAllocation(frame.preActivationLogitsBuffer)
         }
         for buffer in gradientBuffers {
             residency.addAllocation(buffer)
@@ -593,14 +617,21 @@ final class SirenTrainingEngine {
             sirenTrainMaxChunks,
             max(1, (desiredBatch + sirenTrainBatchSize - 1) / sirenTrainBatchSize)
         )
+        // Only zero the gradient spans that will be touched by this step
         if totalWeightCount > 0 {
-            memset(chunkGradientWeightsBuffer.contents(), 0, chunkGradientWeightsBuffer.length)
+            let bytesToZero = chunkSlots * totalWeightCount * MemoryLayout<Float>.stride
+            memset(chunkGradientWeightsBuffer.contents(), 0, bytesToZero)
         }
         if totalBiasCount > 0 {
-            memset(chunkGradientBiasesBuffer.contents(), 0, chunkGradientBiasesBuffer.length)
+            let bytesToZero = chunkSlots * totalBiasCount * MemoryLayout<Float>.stride
+            memset(chunkGradientBiasesBuffer.contents(), 0, bytesToZero)
         }
 
         let frame = frameResources[frameIndex % frameResources.count]
+
+        let layerStride = UInt32(sirenTrainBatchSize * sirenTrainMaxDim)
+        let activationChunkStride = UInt32(mlp.layers.count + 1) * layerStride
+        let preActivationChunkStride = UInt32(mlp.layers.count) * layerStride  // cosDerivativeHistory needs full stride
 
         var params = SirenTrainingParamsUniform(
             batchStart: UInt32(batchStart),
@@ -613,7 +644,10 @@ final class SirenTrainingEngine {
             chunkCount: 0,
             totalWeightCount: UInt32(totalWeightCount),
             totalBiasCount: UInt32(totalBiasCount),
-            chunkCapacity: UInt32(chunkSlots)
+            chunkCapacity: UInt32(chunkSlots),
+            layerStride: layerStride,
+            activationChunkStride: activationChunkStride,
+            preActivationChunkStride: preActivationChunkStride
         )
         frame.lossBuffer.contents().bindMemory(to: Float.self, capacity: 1).pointee = 0
 
@@ -636,16 +670,17 @@ final class SirenTrainingEngine {
         )
         adamParamsBuffer.contents().copyMemory(from: &adamParams, byteCount: MemoryLayout<SirenAdamParamsUniform>.stride)
 
-        trainingArgumentTable.setAddress(positionsBuffer.gpuAddress, index: 2)
-        trainingArgumentTable.setAddress(targetsBuffer.gpuAddress, index: 3)
-        trainingArgumentTable.setAddress(frame.paramsBuffer.gpuAddress, index: 4)
-        trainingArgumentTable.setAddress(layerInputDimsBuffer.gpuAddress, index: 5)
-        trainingArgumentTable.setAddress(layerOutputDimsBuffer.gpuAddress, index: 6)
-        trainingArgumentTable.setAddress(frame.activationHistoryBuffer.gpuAddress, index: 7)
-        trainingArgumentTable.setAddress(frame.preActivationHistoryBuffer.gpuAddress, index: 8)
-        trainingArgumentTable.setAddress(frame.lossBuffer.gpuAddress, index: 9)
+        trainingArgumentTable.setAddress(positionsBuffer.gpuAddress, index: SirenTrainingBufferIndex.positions.rawValue)
+        trainingArgumentTable.setAddress(targetsBuffer.gpuAddress, index: SirenTrainingBufferIndex.targets.rawValue)
+        trainingArgumentTable.setAddress(frame.paramsBuffer.gpuAddress, index: SirenTrainingBufferIndex.params.rawValue)
+        trainingArgumentTable.setAddress(layerInputDimsBuffer.gpuAddress, index: SirenTrainingBufferIndex.layerInputDims.rawValue)
+        trainingArgumentTable.setAddress(layerOutputDimsBuffer.gpuAddress, index: SirenTrainingBufferIndex.layerOutputDims.rawValue)
+        trainingArgumentTable.setAddress(frame.activationHistoryBuffer.gpuAddress, index: SirenTrainingBufferIndex.activationHistory.rawValue)
+        trainingArgumentTable.setAddress(frame.cosDerivativeHistoryBuffer.gpuAddress, index: SirenTrainingBufferIndex.cosDerivativeHistory.rawValue)
+        trainingArgumentTable.setAddress(frame.preActivationLogitsBuffer.gpuAddress, index: SirenTrainingBufferIndex.preActivationLogits.rawValue)
+        trainingArgumentTable.setAddress(frame.lossBuffer.gpuAddress, index: SirenTrainingBufferIndex.lossBuffer.rawValue)
         if let sampleIndexBuffer {
-            trainingArgumentTable.setAddress(sampleIndexBuffer.gpuAddress, index: 10)
+            trainingArgumentTable.setAddress(sampleIndexBuffer.gpuAddress, index: SirenTrainingBufferIndex.sampleIndices.rawValue)
         }
 
         let maxSliceSamples = sirenTrainBatchSize * sirenTrainMaxChunks
@@ -1318,7 +1353,10 @@ private extension SirenTrainingEngine {
         let activationCount = (layerCount + 1) * sirenTrainBatchSize * sirenTrainMaxDim * chunkCapacity
 
         let activationLength = activationCount * MemoryLayout<Float16>.stride
-        let preActivationLength = layerCount * sirenTrainBatchSize * sirenTrainMaxDim * chunkCapacity * MemoryLayout<Float16>.stride
+        // cosDerivativeHistory: only hidden layers (layerCount - 1), but keep full layerCount stride for offset compatibility
+        let cosDerivativeLength = layerCount * sirenTrainBatchSize * sirenTrainMaxDim * chunkCapacity * MemoryLayout<Float16>.stride
+        // preActivationLogits: only final layer, shader now uses layer 0 offset
+        let preActivationLogitsLength = 1 * sirenTrainBatchSize * sirenTrainMaxDim * chunkCapacity * MemoryLayout<Float16>.stride
 
         var frames: [TrainingFrameResources] = []
         frames.reserveCapacity(frameCount)
@@ -1327,7 +1365,8 @@ private extension SirenTrainingEngine {
             guard let paramsBuffer = device.makeBuffer(length: MemoryLayout<SirenTrainingParamsUniform>.stride, options: .storageModeShared),
                   let lossBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared),
                   let activationBuffer = device.makeBuffer(length: activationLength, options: .storageModeShared),
-                  let preActivationBuffer = device.makeBuffer(length: preActivationLength, options: .storageModeShared) else {
+                  let cosDerivativeBuffer = device.makeBuffer(length: cosDerivativeLength, options: .storageModeShared),
+                  let preActivationLogitsBuffer = device.makeBuffer(length: preActivationLogitsLength, options: .storageModeShared) else {
                 throw SirenEncoderError.failedToCreateBuffer
             }
 
@@ -1336,7 +1375,8 @@ private extension SirenTrainingEngine {
                     paramsBuffer: paramsBuffer,
                     lossBuffer: lossBuffer,
                     activationHistoryBuffer: activationBuffer,
-                    preActivationHistoryBuffer: preActivationBuffer
+                    cosDerivativeHistoryBuffer: cosDerivativeBuffer,
+                    preActivationLogitsBuffer: preActivationLogitsBuffer
                 )
             )
         }
