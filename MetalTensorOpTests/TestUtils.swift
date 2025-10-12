@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 import Testing
 
@@ -11,11 +12,42 @@ enum TensorMemoryLayout {
     case rowMajor
 }
 
+private let repositoryRootURL: URL = {
+    var url = URL(fileURLWithPath: #filePath)
+    while url.lastPathComponent != "MetalTensorOpTests" && url.pathComponents.count > 1 {
+        url.deleteLastPathComponent()
+    }
+    if url.lastPathComponent == "MetalTensorOpTests" {
+        url.deleteLastPathComponent()
+    }
+    return url
+}()
+
+private let sharedDataFolderURL: URL = {
+    repositoryRootURL.appendingPathComponent("MetalTensorOp/Data", isDirectory: true)
+}()
+
+func locateDataResource(named resource: String, withExtension ext: String = "json") throws -> URL {
+    if let bundle = Bundle.allBundles.first(where: { $0.bundlePath.contains("MetalTensorOpTests.xctest") }) {
+        if let url = bundle.url(forResource: resource, withExtension: ext) {
+            return url
+        }
+    }
+
+    let candidate = sharedDataFolderURL.appendingPathComponent(resource).appendingPathExtension(ext)
+    if FileManager.default.fileExists(atPath: candidate.path) {
+        return candidate
+    }
+
+    throw TestError("Resource \(resource).\(ext) not found in test bundle or shared data folder at \(candidate.path)")
+}
+
 func makeTensor(
     from buffer: MTLBuffer,
     rows: Int,
     columns: Int,
-    layout: TensorMemoryLayout = .columnMajor
+    layout: TensorMemoryLayout = .columnMajor,
+    dataType: MTLTensorDataType = .float16
 ) throws -> MTLTensor {
     let extents: MTLTensorExtents?
     let strides: MTLTensorExtents?
@@ -41,7 +73,7 @@ func makeTensor(
     descriptor.dimensions = tensorExtents
     descriptor.usage = .compute
     descriptor.strides = tensorStrides
-    descriptor.dataType = .float16
+    descriptor.dataType = dataType
     return try buffer.makeTensor(descriptor: descriptor, offset: 0)
 }
 
@@ -195,7 +227,7 @@ func executeAndWait(
         }
         context.commandQueue.commit([commandBuffer], options: commitOptions)
     }
-    
+
     let elapsed = start.duration(to: ContinuousClock.now)
     print("GPU time (\(testName)): \(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15) ms")
 }

@@ -3,6 +3,11 @@ import Combine
 import Metal
 import MetalKit
 
+enum ModelKind: String, CaseIterable, Hashable {
+    case siren = "Siren"
+    case instantNGP = "Instant NGP"
+}
+
 struct ModelKindKey: EnvironmentKey {
     static let defaultValue: ModelKind = .siren
 }
@@ -15,7 +20,14 @@ extension EnvironmentValues {
 }
 
 protocol ComputeEncoder {
-    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer)
+    func encode(drawableTexture: MTLTexture, commandBuffer: MTL4CommandBuffer, mode: RenderMode)
+    func supports(_ mode: RenderMode) -> Bool
+}
+
+extension ComputeEncoder {
+    func supports(_ mode: RenderMode) -> Bool {
+        mode == .perPixel
+    }
 }
 
 #if os(macOS)
@@ -118,9 +130,11 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     private var drawingEnabled = false
 
     let modelKind: ModelKind
+    var renderMode: RenderMode
 
-    init(modelKind: ModelKind = .siren) {
+    init(modelKind: ModelKind = .siren, renderMode: RenderMode = .perPixel) {
         self.modelKind = modelKind
+        self.renderMode = renderMode
         super.init()
     }
 
@@ -181,29 +195,44 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
             return
         }
 
+        imageWidth = nil
+        imageHeight = nil
+        aspectRatio = nil
+
         do {
             switch modelKind {
             case .siren:
                 encoder = try SirenEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
-            case .fourier:
-                encoder = try FourierEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
+                loadMetadata(resourceName: "siren")
+            case .instantNGP:
+                guard let ngpModel = loadInstantNGPModel() else {
+                    print("[Coordinator] Instant NGP weights unavailable")
+                    drawingEnabled = false
+                    return
+                }
+
+                let metalWeights = try ngpModel.makeMetalWeights(device: device)
+                let instantEncoder = try InstantNGPEncoder(
+                    device: device,
+                    library: library,
+                    compiler: compiler,
+                    queue: commandQueue,
+                    weights: metalWeights
+                )
+                if let image = ngpModel.metadata?.image,
+                   let width = image.width,
+                   let height = image.height {
+                    imageWidth = width
+                    imageHeight = height
+                    aspectRatio = CGFloat(width) / CGFloat(height)
+                }
+                encoder = instantEncoder
             }
         } catch {
+
             print("[Coordinator] Failed to initialize encoder for \(modelKind): \(error)")
             drawingEnabled = false
             return
-        }
-
-        if let url = Bundle.main.url(forResource: modelKind == .fourier ? "fourier" : "siren", withExtension: "json") {
-            if let data = try? Data(contentsOf: url),
-               let model = try? JSONDecoder().decode(ModelFile.self, from: data),
-               let imageMeta = model.metadata?.image {
-                if let width = imageMeta.width, let height = imageMeta.height {
-                    self.imageWidth = width
-                    self.imageHeight = height
-                    self.aspectRatio = CGFloat(width) / CGFloat(height)
-                }
-            }
         }
 
         guard let commandBuffer = device.makeCommandBuffer() else {
@@ -266,7 +295,9 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
 
         commandBuffer.beginCommandBuffer(allocator: commandAllocator)
 
-        encoder.encode(drawableTexture: drawable.texture, commandBuffer: commandBuffer)
+        let desiredMode = renderMode
+        let actualMode = encoder.supports(desiredMode) ? desiredMode : .perPixel
+        encoder.encode(drawableTexture: drawable.texture, commandBuffer: commandBuffer, mode: actualMode)
         commandBuffer.endCommandBuffer()
 
         commandQueue.waitForDrawable(drawable)
@@ -281,12 +312,47 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
     }
 }
 
+extension Coordinator {
+    private func loadMetadata(resourceName: String) {
+        guard let url = Bundle.main.url(forResource: resourceName, withExtension: "json") else {
+            return
+        }
+
+        guard let data = try? Data(contentsOf: url),
+              let model = try? JSONDecoder().decode(ModelFile.self, from: data),
+              let imageMeta = model.metadata?.image,
+              let width = imageMeta.width,
+              let height = imageMeta.height else {
+            return
+        }
+
+        imageWidth = width
+        imageHeight = height
+        aspectRatio = CGFloat(width) / CGFloat(height)
+    }
+
+    private func loadInstantNGPModel() -> InstantNGPModel? {
+        guard let url = Bundle.main.url(forResource: "instant_ngp", withExtension: "json") else {
+            print("[Coordinator] instant_ngp.json not found in bundle")
+            return nil
+        }
+
+        do {
+            return try InstantNGPModel.load(from: url)
+        } catch {
+            print("[Coordinator] Failed to load Instant NGP weights: \(error)")
+            return nil
+        }
+    }
+}
+
 @available(macOS 26.0, iOS 16.0, *)
 struct ContentView: View {
     @Environment(\.modelKind) private var modelKind
+    @Environment(\.renderMode) private var renderMode
 
     var body: some View {
-        let coordinator = Coordinator(modelKind: modelKind)
+        let coordinator = Coordinator(modelKind: modelKind, renderMode: renderMode)
         let width = coordinator.imageWidth.map { CGFloat($0) } ?? 300
         let height = coordinator.imageHeight.map { CGFloat($0) } ?? 300
         
@@ -294,7 +360,7 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
             MetalCircleView(coordinator: coordinator)
                 .frame(width: width, height: height)
-                .id(modelKind)
+                .id("\(modelKind.rawValue)|\(renderMode.rawValue)")
         }
     }
 }
@@ -302,4 +368,5 @@ struct ContentView: View {
 #Preview {
     ContentView()
         .environment(\.modelKind, .siren)
+        .environment(\.renderMode, .perPixel)
 }

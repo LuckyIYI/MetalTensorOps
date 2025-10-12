@@ -1,6 +1,16 @@
 import Foundation
 import Metal
 
+struct MetalMLPTensorArguments {
+    var weight: InlineArray<16, MTLResourceID>
+    var bias: InlineArray<16, MTLResourceID>
+
+    init() {
+        weight = .init(repeating: .init())
+        bias = .init(repeating: .init())
+    }
+}
+
 enum MLPError: Error {
     case metalDeviceUnavailable
     case invalidWeightExtents
