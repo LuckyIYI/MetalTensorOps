@@ -5,7 +5,6 @@ import MetalKit
 
 enum ModelKind: String, CaseIterable, Hashable {
     case siren = "Siren"
-    case fourier = "Fourier"
     case instantNGP = "Instant NGP"
 }
 
@@ -205,9 +204,6 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
             case .siren:
                 encoder = try SirenEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
                 loadMetadata(resourceName: "siren")
-            case .fourier:
-                encoder = try FourierEncoder(device: device, library: library, compiler: compiler, queue: commandQueue)
-                loadMetadata(resourceName: "fourier")
             case .instantNGP:
                 guard let ngpModel = loadInstantNGPModel() else {
                     print("[Coordinator] Instant NGP weights unavailable")

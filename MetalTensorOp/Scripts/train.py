@@ -146,23 +146,34 @@ class HashEncoder(nn.Module):
 
 
 class InstantNGPMLP(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_width=MLP_HIDDEN_WIDTH, num_hidden_layers=1):
         super().__init__()
         in_features = NUM_LEVELS * FEATURES_PER_LEVEL
-        self.layer1 = nn.Linear(in_features, MLP_HIDDEN_WIDTH)
-        self.layer2 = nn.Linear(MLP_HIDDEN_WIDTH, MLP_OUTPUT_DIM)
+
+        # First hidden layer
+        self.hidden_layers = [nn.Linear(in_features, hidden_width)]
+
+        # Additional hidden layers
+        for _ in range(num_hidden_layers - 1):
+            self.hidden_layers.append(nn.Linear(hidden_width, hidden_width))
+
+        # Output layer
+        self.output_layer = nn.Linear(hidden_width, MLP_OUTPUT_DIM)
 
     def __call__(self, x):
-        x = nn.relu(self.layer1(x))
-        x = nn.sigmoid(self.layer2(x))
+        # Pass through all hidden layers with ReLU activation
+        for layer in self.hidden_layers:
+            x = nn.relu(layer(x))
+        # Final layer with sigmoid activation
+        x = nn.sigmoid(self.output_layer(x))
         return x
 
 
 class InstantNGP(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_width=MLP_HIDDEN_WIDTH, num_hidden_layers=1):
         super().__init__()
         self.encoder = HashEncoder()
-        self.mlp = InstantNGPMLP()
+        self.mlp = InstantNGPMLP(hidden_width=hidden_width, num_hidden_layers=num_hidden_layers)
 
     def __call__(self, x):
         features = self.encoder(x)
@@ -202,46 +213,6 @@ class SirenMLP(nn.Module):
         x = self.first(x)
         for layer in self.hidden:
             x = layer(x)
-        x = self.output(x)
-        return mx.sigmoid(x)
-
-
-class FourierFeatureLayer(nn.Module):
-    def __init__(self, in_dim: int, num_frequencies: int, sigma: float):
-        super().__init__()
-        self.B = mx.random.normal(shape=(in_dim, num_frequencies)) * sigma
-        self.sigma = sigma
-
-    def __call__(self, x: mx.array) -> mx.array:
-        proj = mx.matmul(x, self.B)
-        proj = proj * (2.0 * math.pi)
-        return mx.concatenate([mx.sin(proj), mx.cos(proj)], axis=-1)
-
-
-class FourierMLP(nn.Module):
-    def __init__(self, hidden_width: int, num_hidden_layers: int, out_dim: int, num_frequencies: int, sigma: float):
-        super().__init__()
-        self.ff = FourierFeatureLayer(2, num_frequencies, sigma)
-        self.hidden = []
-        input_dim = num_frequencies * 2
-        for _ in range(num_hidden_layers):
-            layer = nn.Linear(input_dim, hidden_width)
-            layer.weight = mx.random.normal(shape=layer.weight.shape) * math.sqrt(2.0 / input_dim)
-            layer.bias = mx.zeros_like(layer.bias)
-            self.hidden.append(layer)
-            input_dim = hidden_width
-        self.output = nn.Linear(input_dim, out_dim)
-        self.output.weight = mx.random.normal(shape=self.output.weight.shape) * math.sqrt(2.0 / input_dim)
-        self.output.bias = mx.zeros_like(self.output.bias)
-
-    @property
-    def linear_layers(self):
-        return [*self.hidden, self.output]
-
-    def __call__(self, x: mx.array) -> mx.array:
-        x = self.ff(x)
-        for layer in self.hidden:
-            x = nn.relu(layer(x))
         x = self.output(x)
         return mx.sigmoid(x)
 
@@ -302,7 +273,7 @@ def export_instant_ngp_weights(net, path, metadata=None, sample_positions=None, 
             }
         },
         "mlp": {
-            "layers": serialize_linear_layers([net.mlp.layer1, net.mlp.layer2])
+            "layers": serialize_linear_layers(net.mlp.hidden_layers + [net.mlp.output_layer])
         }
     }
 
@@ -444,97 +415,14 @@ def train_siren(
             str(recon_path)
         )
 
-
-def train_fourier(
-    image_path: Path,
-    weights_path: Path,
-    steps: int,
-    lr: float,
-    hidden_width: int,
-    num_layers: int,
-    num_frequencies: int,
-    sigma: float,
-    max_dim: int,
-    sample_count: int,
-    sample_seed: int,
-    batch_size: int | None,
-):
-    print("Training Fourier MLP (MLX)")
-    positions, colors, width, height = sample_image(image_path, max_dim=max_dim, space="minus_one_one")
-
-    X = mx.array(positions)
-    Y = mx.array(colors)
-
-    model = FourierMLP(hidden_width=hidden_width, num_hidden_layers=num_layers, out_dim=3, num_frequencies=num_frequencies, sigma=sigma)
-    optimizer = optim.Adam(learning_rate=lr)
-
-    def loss_fn(model, x, y):
-        prediction = model(x)
-        return mx.mean(mx.square(prediction - y))
-
-    loss_and_grad = nn.value_and_grad(model, loss_fn)
-
-    batch_size = min(batch_size or positions.shape[0], positions.shape[0])
-    num_samples = positions.shape[0]
-
-    for it in range(1, steps + 1):
-        indices = mx.random.randint(0, num_samples, (batch_size,))
-        batch_X = X[indices]
-        batch_Y = Y[indices]
-        loss, grads = loss_and_grad(model, batch_X, batch_Y)
-        optimizer.update(model, grads)
-        mx.eval(model.parameters(), optimizer.state, loss)
-        if it % max(steps // 10, 1) == 0 or it == 1:
-            loss_val = float(loss)
-            psnr = compute_psnr(loss_val)
-            print(f"step {it:4d}   loss = {loss_val:.6f}   PSNR = {psnr:.2f} dB")
-
-    metadata = {
-        "mode": "image",
-        "image": {
-            "width": int(width),
-            "height": int(height),
-            "aspect_ratio": float(width) / float(height)
-        }
-    }
-
-    export_basic_mlp_weights(
-        model.linear_layers,
-        weights_path,
-        metadata,
-        "fourier",
-        sample_positions=positions,
-        sample_colors=colors,
-        sample_count=sample_count,
-        sample_seed=sample_seed,
-        extra_fields={
-            "fourier": {
-                "B": np.array(model.ff.B).astype(np.float32).tolist(),
-                "sigma": model.ff.sigma
-            }
-        }
-    )
-
-    if Image is not None:
-        recon_path = weights_path.with_name(f"{weights_path.stem}_reconstructed.png")
-        reconstruct_and_save(
-            model,
-            positions,
-            (int(width), int(height)),
-            batch_size,
-            str(recon_path)
-        )
-
-
-
-def train_instant_ngp(positions, colors, image_shape, steps, lr, weights_path, metadata, sample_count, sample_seed):
+def train_instant_ngp(positions, colors, image_shape, steps, lr, weights_path, metadata, sample_count, sample_seed, hidden_width=MLP_HIDDEN_WIDTH, num_layers=1, batch_size=None):
     """Train Instant NGP on image using MLX"""
     print("Training on MLX (Apple Silicon)")
 
     X = mx.array(positions)
     Y = mx.array(colors)
 
-    model = InstantNGP()
+    model = InstantNGP(hidden_width=hidden_width, num_hidden_layers=num_layers)
     optimizer = optim.Adam(learning_rate=lr)
 
     # Print parameter count
@@ -555,7 +443,7 @@ def train_instant_ngp(positions, colors, image_shape, steps, lr, weights_path, m
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
-    batch_size = min(99999, positions.shape[0])
+    batch_size = min(batch_size or 99999, positions.shape[0])
     num_samples = len(positions)
 
     for it in range(1, steps + 1):
@@ -600,20 +488,16 @@ def train_instant_ngp(positions, colors, image_shape, steps, lr, weights_path, m
         )
 
 
-
-
 def main():
     ap = argparse.ArgumentParser(description='Train neural field models with MLX')
-    ap.add_argument('--model', choices=['instant-ngp', 'siren', 'fourier'], default='instant-ngp', help='Model to train')
+    ap.add_argument('--model', choices=['instant-ngp', 'siren'], default='instant-ngp', help='Model to train')
     ap.add_argument('--image', required=True, help='Input image file')
     ap.add_argument('--weights', help='Output weights file (default depends on model)')
     ap.add_argument('--max_dim', type=int, default=1080, help='Max image dimension (default: 384)')
     ap.add_argument('--steps', type=int, default=2000, help='Training steps (default: 2000)')
     ap.add_argument('--lr', type=float, default=1e-3, help='Learning rate (default: 1e-3)')
     ap.add_argument('--hidden-width', type=int, default=64, help='Hidden width for MLPs (default: 64)')
-    ap.add_argument('--num-layers', type=int, default=4, help='Hidden layer count for MLPs (default: 4)')
-    ap.add_argument('--num-frequencies', type=int, default=64, help='Number of Fourier frequencies (default: 64)')
-    ap.add_argument('--sigma', type=float, default=1.0, help='Sigma for Fourier features (default: 1.0)')
+    ap.add_argument('--num-layers', type=int, default=1, help='Hidden layer count for MLPs (default: 1)')
     ap.add_argument('--sample-count', type=int, default=256, help='Number of embedded samples (default: 256)')
     ap.add_argument('--sample-seed', type=int, default=1337, help='Sample selection seed (default: 1337)')
     ap.add_argument('--batch-size', type=int, help='Override training batch size (default: full batch)')
@@ -622,8 +506,7 @@ def main():
     image_path = Path(args.image)
     default_weights = {
         'instant-ngp': 'instant_ngp.json',
-        'siren': 'siren.json',
-        'fourier': 'fourier.json'
+        'siren': 'siren.json'
     }
     weights_path = Path(args.weights if args.weights else default_weights[args.model])
 
@@ -648,7 +531,10 @@ def main():
             str(weights_path),
             metadata,
             args.sample_count,
-            args.sample_seed
+            args.sample_seed,
+            hidden_width=args.hidden_width,
+            num_layers=args.num_layers,
+            batch_size=args.batch_size
         )
     elif args.model == 'siren':
         train_siren(
@@ -658,21 +544,6 @@ def main():
             lr=args.lr,
             hidden_width=args.hidden_width,
             num_layers=args.num_layers,
-            max_dim=args.max_dim,
-            sample_count=args.sample_count,
-            sample_seed=args.sample_seed,
-            batch_size=args.batch_size,
-        )
-    elif args.model == 'fourier':
-        train_fourier(
-            image_path=image_path,
-            weights_path=weights_path,
-            steps=args.steps,
-            lr=args.lr,
-            hidden_width=args.hidden_width,
-            num_layers=args.num_layers,
-            num_frequencies=args.num_frequencies,
-            sigma=args.sigma,
             max_dim=args.max_dim,
             sample_count=args.sample_count,
             sample_seed=args.sample_seed,

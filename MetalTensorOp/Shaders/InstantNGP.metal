@@ -406,10 +406,7 @@ kernel void instantNGPRender(
 
     const uint texture_width = outTexture.get_width();
     const uint texture_height = outTexture.get_height();
-    const float texture_width_coop = float(texture_width);
-    const float texture_height_coop = float(texture_height);
-    const float denom_x = (texture_width > 1) ? float(texture_width - 1) : 1.0f;
-    const float denom_y = (texture_height > 1) ? float(texture_height - 1) : 1.0f;
+
 
     if (gid.x >= texture_width || gid.y >= texture_height) {
         return;
