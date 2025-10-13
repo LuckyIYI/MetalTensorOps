@@ -22,7 +22,7 @@ struct InstantNGPRenderUniforms {
 // Hash encoding parameters
 #define NGP_NUM_LEVELS 16
 #define NGP_FEATURES_PER_LEVEL 2
-#define NGP_LOG2_HASHMAP_SIZE 12
+#define NGP_LOG2_HASHMAP_SIZE 14
 #define NGP_BASE_RESOLUTION 16
 #define NGP_MAX_RESOLUTION 2048
 #define NGP_TOTAL_FEATURES (NGP_NUM_LEVELS * NGP_FEATURES_PER_LEVEL)
@@ -34,7 +34,7 @@ struct InstantNGPRenderUniforms {
 #define NGP_BATCH_SIZE 64  // Process 64 positions per threadgroup
 
 // Hash function: 2D spatial hash matching MLX implementation
-inline uint hash_position_2d(uint2 pos) {
+inline uint hashPosition2d(uint2 pos) {
     constexpr uint primes[2] = {1u, 2654435761u};
     uint result = 0;
     result ^= pos.x * primes[0];
@@ -44,27 +44,27 @@ inline uint hash_position_2d(uint2 pos) {
 
 // Compute multi-resolution hash encoding for 2D position (MLX-compatible)
 // Bilinear interpolation with 4 corners
-inline void compute_hash_encoding_2d(
+inline void computeHashEncoding2d(
     float2 position,
-    device half *hash_table,
-    thread float *encoded_features,
+    device half *hashTable,
+    thread float *encodedFeatures,
     uint level
 ) {
-    const float ln_min = floor(log((float)NGP_BASE_RESOLUTION));
-    const float ln_max = floor(log((float)NGP_MAX_RESOLUTION));
+    const float lnMin = floor(log((float)NGP_BASE_RESOLUTION));
+    const float lnMax = floor(log((float)NGP_MAX_RESOLUTION));
     const float t = (NGP_NUM_LEVELS > 1) ? (float(level) / float(NGP_NUM_LEVELS - 1)) : 0.0f;
-    const float scale_factor = exp(mix(ln_min, ln_max, t));
+    const float scaleFactor = exp(mix(lnMin, lnMax, t));
 
-    const float2 scaled_pos = position * scale_factor;
-    const float2 pos_floor = floor(scaled_pos);
-    const float2 pos_fract = scaled_pos - pos_floor;
+    const float2 scaledPos = position * scaleFactor;
+    const float2 posFloor = floor(scaledPos);
+    const float2 posFract = scaledPos - posFloor;
 
-    const uint2 pos_grid = uint2(pos_floor);
+    const uint2 posGrid = uint2(posFloor);
 
     // Hash encoding with bilinear interpolation (4 corners)
-    float accumulated_features[NGP_FEATURES_PER_LEVEL] = {};
+    float accumulatedFeatures[NGP_FEATURES_PER_LEVEL] = {};
 
-    const uint table_size = 1u << NGP_LOG2_HASHMAP_SIZE;
+    const uint tableSize = 1u << NGP_LOG2_HASHMAP_SIZE;
 
     // Process 4 corners: [0,0], [0,1], [1,0], [1,1]
     for (uint corner = 0; corner < 4; ++corner) {
@@ -73,40 +73,40 @@ inline void compute_hash_encoding_2d(
             (corner >> 1) & 1
         );
 
-        const uint2 corner_pos = pos_grid + offset;
+        const uint2 cornerPos = posGrid + offset;
 
         // Compute bilinear weight for this corner
-        const float wx = (offset.x == 0) ? (1.0f - pos_fract.x) : pos_fract.x;
-        const float wy = (offset.y == 0) ? (1.0f - pos_fract.y) : pos_fract.y;
+        const float wx = (offset.x == 0) ? (1.0f - posFract.x) : posFract.x;
+        const float wy = (offset.y == 0) ? (1.0f - posFract.y) : posFract.y;
         const float weight = wx * wy;
 
         // Hash to table index (matching MLX)
-        const uint hash = hash_position_2d(corner_pos);
-        const uint hash_index = hash % table_size;
+        const uint hash = hashPosition2d(cornerPos);
+        const uint hashIndex = hash % tableSize;
 
         // Accumulate features from hash table
-        const uint feature_offset = (level * table_size + hash_index) * NGP_FEATURES_PER_LEVEL;
+        const uint featureOffset = (level * tableSize + hashIndex) * NGP_FEATURES_PER_LEVEL;
 
         for (uint f = 0; f < NGP_FEATURES_PER_LEVEL; ++f) {
-            accumulated_features[f] += weight * float(hash_table[feature_offset + f]);
+            accumulatedFeatures[f] += weight * float(hashTable[featureOffset + f]);
         }
     }
 
     // Write to output
-    const uint output_offset = level * NGP_FEATURES_PER_LEVEL;
+    const uint outputOffset = level * NGP_FEATURES_PER_LEVEL;
     for (uint f = 0; f < NGP_FEATURES_PER_LEVEL; ++f) {
-        encoded_features[output_offset + f] = accumulated_features[f];
+        encodedFeatures[outputOffset + f] = accumulatedFeatures[f];
     }
 }
 
 // Full hash encoding across all levels (2D version)
-inline void compute_full_hash_encoding_2d(
+inline void computeFullHashEncoding2d(
     float2 position,
-    device half *hash_table,
-    thread float *encoded_features
+    device half *hashTable,
+    thread float *encodedFeatures
 ) {
     for (uint level = 0; level < NGP_NUM_LEVELS; ++level) {
-        compute_hash_encoding_2d(position, hash_table, encoded_features, level);
+        computeHashEncoding2d(position, hashTable, encodedFeatures, level);
     }
 }
 
@@ -159,7 +159,7 @@ inline void instantNGPRunCooperativeBatch(
         }
 
         thread float encodedFeatures[NGP_TOTAL_FEATURES];
-        compute_full_hash_encoding_2d(position, hashTable, encodedFeatures);
+        computeFullHashEncoding2d(position, hashTable, encodedFeatures);
 
         #pragma unroll
         for (uint f = 0; f < NGP_TOTAL_FEATURES; ++f) {
@@ -396,7 +396,7 @@ kernel void instantNGPRender(
     texture2d<float, access::write> outTexture [[texture(0)]],
     constant DeviceMLPLayers &mlpLayers [[buffer(0)]],
     constant uint &mlpLayerCount [[buffer(1)]],
-    device half *hash_table [[buffer(2)]],
+    device half *hashTable [[buffer(2)]],
     constant InstantNGPRenderUniforms &uniforms [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -404,30 +404,30 @@ kernel void instantNGPRender(
         return;
     }
 
-    const uint texture_width = outTexture.get_width();
-    const uint texture_height = outTexture.get_height();
+    const uint textureWidth = outTexture.get_width();
+    const uint textureHeight = outTexture.get_height();
 
 
-    if (gid.x >= texture_width || gid.y >= texture_height) {
+    if (gid.x >= textureWidth || gid.y >= textureHeight) {
         return;
     }
 
     const uint2 pixel = gid;
-    const float texture_width_f = float(texture_width);
-    const float texture_height_f = float(texture_height);
+    const float textureWidthF = float(textureWidth);
+    const float textureHeightF = float(textureHeight);
 
-    float2 uv = float2(float(pixel.x), float(pixel.y)) / float2(texture_width_f - 1.0, texture_height_f - 1.0);
+    float2 uv = float2(float(pixel.x), float(pixel.y)) / float2(textureWidthF - 1.0, textureHeightF - 1.0);
 
     if (uniforms.trainingWidth > 0 && uniforms.trainingHeight > 0) {
-        const float target_aspect = float(uniforms.trainingWidth) / float(uniforms.trainingHeight);
-        const float texture_aspect = texture_width_f / texture_height_f;
+        const float targetAspect = float(uniforms.trainingWidth) / float(uniforms.trainingHeight);
+        const float textureAspect = textureWidthF / textureHeightF;
 
-        if (texture_aspect > target_aspect) {
-            const float visible = target_aspect / texture_aspect;
+        if (textureAspect > targetAspect) {
+            const float visible = targetAspect / textureAspect;
             const float left = 0.5f - 0.5f * visible;
             uv.x = (uv.x - left) / visible;
-        } else if (texture_aspect < target_aspect) {
-            const float visible = texture_aspect / target_aspect;
+        } else if (textureAspect < targetAspect) {
+            const float visible = textureAspect / targetAspect;
             const float top = 0.5f - 0.5f * visible;
             uv.y = (uv.y - top) / visible;
         }
@@ -438,24 +438,24 @@ kernel void instantNGPRender(
         return;
     }
 
-    thread float encoded_features_f32[NGP_TOTAL_FEATURES];
-    compute_full_hash_encoding_2d(uv, hash_table, encoded_features_f32);
+    thread float encodedFeaturesF32[NGP_TOTAL_FEATURES];
+    computeFullHashEncoding2d(uv, hashTable, encodedFeaturesF32);
 
-    thread half encoded_features[NGP_TOTAL_FEATURES];
+    thread half encodedFeatures[NGP_TOTAL_FEATURES];
     for (uint f = 0; f < NGP_TOTAL_FEATURES; ++f) {
-        encoded_features[f] = half(encoded_features_f32[f]);
+        encodedFeatures[f] = half(encodedFeaturesF32[f]);
     }
-    auto encoded_tensor = tensor(encoded_features, dextents<int, 2>(NGP_TOTAL_FEATURES, 1));
+    auto encodedTensor = tensor(encodedFeatures, dextents<int, 2>(NGP_TOTAL_FEATURES, 1));
 
-    thread half hidden_activation[NGP_MLP_HIDDEN_WIDTH];
-    thread half next_activation[NGP_MLP_HIDDEN_WIDTH];
-    auto hidden_tensor = tensor(hidden_activation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
-    auto next_tensor = tensor(next_activation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+    thread half hiddenActivation[NGP_MLP_HIDDEN_WIDTH];
+    thread half nextActivation0[NGP_MLP_HIDDEN_WIDTH];
+    auto hiddenTensor = tensor(hiddenActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+    auto nextTensor = tensor(nextActivation0, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
 
-    thread half output_activation[NGP_MLP_OUTPUT_DIM];
-    auto output_tensor = tensor(output_activation, dextents<int, 2>(NGP_MLP_OUTPUT_DIM, 1));
+    thread half outputActivation[NGP_MLP_OUTPUT_DIM];
+    auto outputTensor = tensor(outputActivation, dextents<int, 2>(NGP_MLP_OUTPUT_DIM, 1));
 
-    constexpr auto first_layer_desc = matmul2d_descriptor(
+    constexpr auto firstLlayerDesc = matmul2d_descriptor(
         1,
         NGP_MLP_HIDDEN_WIDTH,
         NGP_TOTAL_FEATURES,
@@ -465,7 +465,7 @@ kernel void instantNGPRender(
         matmul2d_descriptor::mode::multiply
     );
 
-    constexpr auto hidden_layer_desc = matmul2d_descriptor(
+    constexpr auto hiddenLayerDesc = matmul2d_descriptor(
         1,
         NGP_MLP_HIDDEN_WIDTH,
         NGP_MLP_HIDDEN_WIDTH,
@@ -475,7 +475,7 @@ kernel void instantNGPRender(
         matmul2d_descriptor::mode::multiply
     );
 
-    constexpr auto output_layer_desc = matmul2d_descriptor(
+    constexpr auto outputLayerDesc = matmul2d_descriptor(
         1,
         NGP_MLP_OUTPUT_DIM,
         NGP_MLP_HIDDEN_WIDTH,
@@ -485,29 +485,29 @@ kernel void instantNGPRender(
         matmul2d_descriptor::mode::multiply
     );
 
-    matmul2d<first_layer_desc, execution_thread> first_layer_matmul;
-    matmul2d<hidden_layer_desc, execution_thread> hidden_layer_matmul;
-    matmul2d<output_layer_desc, execution_thread> output_layer_matmul;
+    matmul2d<firstLlayerDesc, execution_thread> firstLayerMatmul;
+    matmul2d<hiddenLayerDesc, execution_thread> hiddenLayerMatmul;
+    matmul2d<outputLayerDesc, execution_thread> outputLayerMatmul;
 
     auto firstLayerWeights = mlpLayers.weights[0];
     auto firstLayerBias = mlpLayers.biases[0];
-    first_layer_matmul.run(encoded_tensor, firstLayerWeights, hidden_tensor);
+    firstLayerMatmul.run(encodedTensor, firstLayerWeights, hiddenTensor);
     for (uint i = 0; i < NGP_MLP_HIDDEN_WIDTH; ++i) {
-        float value = float(hidden_tensor[i, 0]) + float(firstLayerBias[i]);
-        hidden_activation[i] = half(activation_relu(value));
+        float value = float(hiddenTensor[i, 0]) + float(firstLayerBias[i]);
+        hiddenActivation[i] = half(activation_relu(value));
     }
 
-    thread half *currentActivation = hidden_activation;
-    thread half *nextActivation = next_activation;
+    thread half *currentActivation = hiddenActivation;
+    thread half *nextActivation = nextActivation0;
 
     for (uint layerIndex = 1; layerIndex + 1 < mlpLayerCount; ++layerIndex) {
-        auto input_tensor = tensor(currentActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
-        auto output_temp_tensor = tensor(nextActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+        auto inputTensor = tensor(currentActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+        auto outputTempTensor = tensor(nextActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
         auto weights = mlpLayers.weights[layerIndex];
         auto biases = mlpLayers.biases[layerIndex];
-        hidden_layer_matmul.run(input_tensor, weights, output_temp_tensor);
+        hiddenLayerMatmul.run(inputTensor, weights, outputTempTensor);
         for (uint i = 0; i < NGP_MLP_HIDDEN_WIDTH; ++i) {
-            float value = float(output_temp_tensor[i, 0]) + float(biases[i]);
+            float value = float(outputTempTensor[i, 0]) + float(biases[i]);
             nextActivation[i] = half(activation_relu(value));
         }
         thread half *temp = currentActivation;
@@ -515,15 +515,15 @@ kernel void instantNGPRender(
         nextActivation = temp;
     }
 
-    auto final_input_tensor = tensor(currentActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
+    auto finalInputTensor = tensor(currentActivation, dextents<int, 2>(NGP_MLP_HIDDEN_WIDTH, 1));
     const uint lastLayerIndex = mlpLayerCount - 1;
     auto outputWeights = mlpLayers.weights[lastLayerIndex];
     auto outputBias = mlpLayers.biases[lastLayerIndex];
-    output_layer_matmul.run(final_input_tensor, outputWeights, output_tensor);
+    outputLayerMatmul.run(finalInputTensor, outputWeights, outputTensor);
 
     float3 rgb;
     for (uint channel = 0; channel < NGP_MLP_OUTPUT_DIM; ++channel) {
-        float value = float(output_tensor[channel, 0]) + float(outputBias[channel]);
+        float value = float(outputTensor[channel, 0]) + float(outputBias[channel]);
         rgb[channel] = activation_sigmoid(value);
     }
 

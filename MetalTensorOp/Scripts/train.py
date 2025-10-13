@@ -23,7 +23,7 @@ except ImportError:
 # Config matching Metal implementation
 NUM_LEVELS = 16
 FEATURES_PER_LEVEL = 2
-LOG2_HASHMAP_SIZE = 12
+LOG2_HASHMAP_SIZE = 14
 BASE_RESOLUTION = 16.0
 MAX_RESOLUTION = 2048.0
 TOTAL_FEATURES = NUM_LEVELS * FEATURES_PER_LEVEL
@@ -492,15 +492,15 @@ def main():
     ap = argparse.ArgumentParser(description='Train neural field models with MLX')
     ap.add_argument('--model', choices=['instant-ngp', 'siren'], default='instant-ngp', help='Model to train')
     ap.add_argument('--image', required=True, help='Input image file')
-    ap.add_argument('--weights', help='Output weights file (default depends on model)')
-    ap.add_argument('--max_dim', type=int, default=1080, help='Max image dimension (default: 384)')
-    ap.add_argument('--steps', type=int, default=2000, help='Training steps (default: 2000)')
-    ap.add_argument('--lr', type=float, default=1e-3, help='Learning rate (default: 1e-3)')
-    ap.add_argument('--hidden-width', type=int, default=64, help='Hidden width for MLPs (default: 64)')
-    ap.add_argument('--num-layers', type=int, default=1, help='Hidden layer count for MLPs (default: 1)')
-    ap.add_argument('--sample-count', type=int, default=256, help='Number of embedded samples (default: 256)')
-    ap.add_argument('--sample-seed', type=int, default=1337, help='Sample selection seed (default: 1337)')
-    ap.add_argument('--batch-size', type=int, help='Override training batch size (default: full batch)')
+    ap.add_argument('--weights', help='Output weights file')
+    ap.add_argument('--max_dim', type=int, default=1920, help='Max image dimension')
+    ap.add_argument('--steps', type=int, default=2000, help='Training steps')
+    ap.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    ap.add_argument('--hidden-width', type=int, default=64, help='Hidden width for MLPs')
+    ap.add_argument('--num-layers', type=int, default=1, help='Hidden layer count for MLPs')
+    ap.add_argument('--sample-count', type=int, default=256, help='Number of embedded samples')
+    ap.add_argument('--sample-seed', type=int, default=1337, help='Sample selection seed')
+    ap.add_argument('--batch-size', type=int, help='Override training batch size')
     args = ap.parse_args()
 
     image_path = Path(args.image)

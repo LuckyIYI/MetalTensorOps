@@ -60,6 +60,7 @@ struct MetalCircleView: NSViewRepresentable {
 
         context.coordinator.setup(device: device, mtkView: mtkView)
 
+        // Use training resolution for drawable
         if let width = context.coordinator.imageWidth, let height = context.coordinator.imageHeight {
             mtkView.drawableSize = CGSize(width: width, height: height)
         } else {
@@ -93,9 +94,10 @@ struct MetalCircleView: UIViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.clearColor = .init(red: 0, green: 0, blue: 0, alpha: 1)
         mtkView.backgroundColor = .black
-    
+
         context.coordinator.setup(device: device, mtkView: mtkView)
 
+        // Use training resolution for drawable
         if let width = context.coordinator.imageWidth, let height = context.coordinator.imageHeight {
             mtkView.drawableSize = CGSize(width: width, height: height)
         } else {
@@ -129,13 +131,20 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
 
     private var drawingEnabled = false
 
-    let modelKind: ModelKind
+    var modelKind: ModelKind
     var renderMode: RenderMode
 
     init(modelKind: ModelKind = .siren, renderMode: RenderMode = .perPixel) {
         self.modelKind = modelKind
         self.renderMode = renderMode
         super.init()
+    }
+
+    func updateIfNeeded(modelKind: ModelKind, renderMode: RenderMode) {
+        if self.modelKind != modelKind || self.renderMode != renderMode {
+            self.modelKind = modelKind
+            self.renderMode = renderMode
+        }
     }
 
     struct ModelFile: Decodable {
@@ -250,12 +259,6 @@ class Coordinator: NSObject, MTKViewDelegate, ObservableObject {
 
         commandQueue.addResidencySet(metalLayer.residencySet)
 
-        if let width = imageWidth, let height = imageHeight {
-            mtkView.drawableSize = CGSize(width: width, height: height)
-        } else {
-            mtkView.drawableSize = CGSize(width: 300, height: 300)
-        }
-
         drawingEnabled = true
     }
 
@@ -350,16 +353,20 @@ extension Coordinator {
 struct ContentView: View {
     @Environment(\.modelKind) private var modelKind
     @Environment(\.renderMode) private var renderMode
+    @StateObject private var coordinator: Coordinator
+
+    init() {
+        _coordinator = StateObject(wrappedValue: Coordinator())
+    }
 
     var body: some View {
-        let coordinator = Coordinator(modelKind: modelKind, renderMode: renderMode)
-        let width = coordinator.imageWidth.map { CGFloat($0) } ?? 300
-        let height = coordinator.imageHeight.map { CGFloat($0) } ?? 300
-        
+        // Update coordinator when environment changes
+        let _ = coordinator.updateIfNeeded(modelKind: modelKind, renderMode: renderMode)
+
         ZStack {
             Color.black.ignoresSafeArea()
             MetalCircleView(coordinator: coordinator)
-                .frame(width: width, height: height)
+                .aspectRatio(coordinator.aspectRatio ?? 1.0, contentMode: .fit)
                 .id("\(modelKind.rawValue)|\(renderMode.rawValue)")
         }
     }

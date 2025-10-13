@@ -109,6 +109,7 @@ struct InstantNGPMetalWeights {
     let mlp: MLP
     let imageWidth: Int
     let imageHeight: Int
+    let config: InstantNGPConfig
 }
 
 struct InstantNGPEncoding: Codable {
@@ -168,13 +169,8 @@ extension InstantNGPModel {
             throw InstantNGPError.invalidConfiguration
         }
 
-        guard encoding.numLevels == InstantNGPConfig.numLevels,
-              encoding.featuresPerLevel == InstantNGPConfig.featuresPerLevel,
-              encoding.log2HashmapSize == InstantNGPConfig.log2HashmapSize,
-              encoding.baseResolution == InstantNGPConfig.baseResolution,
-              encoding.maxResolution == InstantNGPConfig.maxResolution else {
-            throw InstantNGPError.invalidConfiguration
-        }
+        // Create config from parsed JSON data
+        let config = InstantNGPConfig(encoding: encoding, mlp: mlp)
 
         let expectedHashCount = encoding.numLevels * encoding.featuresPerLevel * (1 << encoding.log2HashmapSize)
         let expandedHash = expandHashData(values: encoding.hashTable.data, expectedCount: expectedHashCount)
@@ -196,7 +192,8 @@ extension InstantNGPModel {
             encoding: encoding,
             mlp: mlp,
             imageWidth: imageWidth,
-            imageHeight: imageHeight
+            imageHeight: imageHeight,
+            config: config
         )
     }
 

@@ -11,16 +11,41 @@ enum InstantNGPError: Error {
 }
 
 struct InstantNGPConfig {
-    static let numLevels = 16
-    static let featuresPerLevel = 2
-    static let log2HashmapSize = 12
-    static let baseResolution = 16
-    static let maxResolution = 2048
-    static let totalFeatures = numLevels * featuresPerLevel
+    let numLevels: Int
+    let featuresPerLevel: Int
+    let log2HashmapSize: Int
+    let baseResolution: Int
+    let maxResolution: Int
+    let totalFeatures: Int
 
-    static let mlpHiddenWidth = 64
-    static let mlpOutputDim = 3
-    static let batchSize = 64
+    let mlpHiddenWidth: Int
+    let mlpOutputDim: Int
+    let batchSize: Int
+
+    init(encoding: InstantNGPEncoding, mlp: MLP, batchSize: Int = 64) {
+        self.numLevels = encoding.numLevels
+        self.featuresPerLevel = encoding.featuresPerLevel
+        self.log2HashmapSize = encoding.log2HashmapSize
+        self.baseResolution = encoding.baseResolution
+        self.maxResolution = encoding.maxResolution
+        self.totalFeatures = encoding.numLevels * encoding.featuresPerLevel
+
+        // Infer MLP dimensions from the actual layer weights
+        // First layer weight should be [hiddenWidth, inputDim]
+        // Last layer weight should be [outputDim, hiddenWidth]
+        if mlp.layers.count >= 2 {
+            let firstLayerWeightDims = mlp.layers[0].weightTensor.dimensions.extents
+            let lastLayerWeightDims = mlp.layers[mlp.layers.count - 1].weightTensor.dimensions.extents
+            self.mlpHiddenWidth = firstLayerWeightDims[0]
+            self.mlpOutputDim = lastLayerWeightDims[0]
+        } else {
+            // Fallback values
+            self.mlpHiddenWidth = 64
+            self.mlpOutputDim = 3
+        }
+
+        self.batchSize = batchSize
+    }
 }
 
 final class InstantNGPEncoder: ComputeEncoder {
@@ -39,6 +64,7 @@ final class InstantNGPEncoder: ComputeEncoder {
     private let cooperativeBufferResidencySet: MTLResidencySet
 
     private let weights: InstantNGPMetalWeights
+    private let config: InstantNGPConfig
     private let renderUniformsBuffer: MTLBuffer
     private let numPositionsBuffer: MTLBuffer
     private let tensorArgumentsBuffer: MTLBuffer
@@ -63,6 +89,7 @@ final class InstantNGPEncoder: ComputeEncoder {
         self.queue = queue
 
         self.weights = weights
+        self.config = weights.config
 
         guard let renderUniformsBuffer = device.makeBuffer(length: MemoryLayout<RenderUniforms>.stride, options: .storageModeShared) else {
             throw InstantNGPError.failedToCreateBuffer
@@ -244,7 +271,7 @@ final class InstantNGPEncoder: ComputeEncoder {
             height: 1,
             depth: 1
         )
-        let numBatches = max(1, (numPixels + InstantNGPConfig.batchSize - 1) / InstantNGPConfig.batchSize)
+        let numBatches = max(1, (numPixels + config.batchSize - 1) / config.batchSize)
         let threadgroupsPerGrid = MTLSize(width: numBatches, height: 1, depth: 1)
 
         encoder.dispatchThreadgroups(
@@ -274,7 +301,7 @@ final class InstantNGPEncoder: ComputeEncoder {
             height: 1,
             depth: 1
         )
-        let numBatches = max(1, (Int(numPositions) + InstantNGPConfig.batchSize - 1) / InstantNGPConfig.batchSize)
+        let numBatches = max(1, (Int(numPositions) + config.batchSize - 1) / config.batchSize)
         let threadgroupsPerGrid = MTLSize(width: 1, height: numBatches, depth: 1)
         encoder.dispatchThreadgroups(
             threadgroupsPerGrid: threadgroupsPerGrid,
