@@ -216,6 +216,225 @@ struct Metal4Tests {
         verifyMatrixVectorResult(bufferC: bufferC, M: M, K: K, matrixA: matrixA, vectorB: vectorB)
     }
 
+    @Test func testSimdgroupMatrixVector() async throws {
+        let context = try TestContext()
+        let problemSizes: [(rows: Int, cols: Int)] = [
+            (rows: 24, cols: 37),   // small, odd sizes
+            (rows: 64, cols: 128),  // power-of-two tile aligned
+            (rows: 113, cols: 255)  // large, non-aligned to tile width
+        ]
+
+        for (index, problem) in problemSizes.enumerated() {
+            let (bufferA, bufferB, bufferC, matrixA, vectorB) = try setupMatrixVectorTest(device: context.device, M: problem.rows, K: problem.cols)
+
+            let tensorA = try makeTensor(from: bufferA, rows: problem.rows, columns: problem.cols)
+            let tensorB = try makeTensor(from: bufferB, rows: problem.cols, columns: 1)
+            let tensorC = try makeTensor(from: bufferC, rows: problem.rows, columns: 1)
+
+            let simdgroupEncoder = try SimdMatrixVectorEncoder(
+                device: context.device,
+                library: context.library,
+                compiler: context.compiler,
+                queue: context.commandQueue,
+                tensorA: tensorA,
+                tensorB: tensorB,
+                tensorC: tensorC
+            )
+
+            try await executeAndWait(context: context, testName: "SimdgroupMatrixVector_case\(index)") { commandBuffer in
+                simdgroupEncoder.encode(commandBuffer: commandBuffer, rows: problem.rows)
+            }
+
+            verifyMatrixVectorResult(bufferC: bufferC, M: problem.rows, K: problem.cols, matrixA: matrixA, vectorB: vectorB)
+        }
+    }
+
+    @Test func testSimdHierarchicalMatrixVector() async throws {
+        let context = try TestContext()
+        let problemSizes: [(rows: Int, cols: Int)] = [
+            (rows: 24, cols: 37),
+            (rows: 64, cols: 128),
+            (rows: 113, cols: 255)
+        ]
+
+        for (index, problem) in problemSizes.enumerated() {
+            let (bufferA, bufferB, bufferC, matrixA, vectorB) = try setupMatrixVectorTest(device: context.device, M: problem.rows, K: problem.cols)
+
+            let hierarchicalEncoder = try SimdHierarchicalMatrixVectorEncoder(
+                device: context.device,
+                library: context.library,
+                compiler: context.compiler,
+                queue: context.commandQueue,
+                bufferA: bufferA,
+                bufferB: bufferB,
+                bufferC: bufferC
+            )
+
+            try await executeAndWait(context: context, testName: "SimdHierarchicalMatrixVector_case\(index)") { commandBuffer in
+                hierarchicalEncoder.encode(commandBuffer: commandBuffer, rows: problem.rows, columns: problem.cols)
+            }
+
+            verifyMatrixVectorResult(bufferC: bufferC, M: problem.rows, K: problem.cols, matrixA: matrixA, vectorB: vectorB)
+        }
+    }
+
+    @Test(.timeLimit(.minutes(4))) func testGemvPerformance() async throws {
+        let context = try TestContext()
+        let cases: [(rows: Int, cols: Int, samples: Int)] = [
+            (rows: 128, cols: 512, samples: 8),
+            (rows: 256, cols: 1024, samples: 10),
+            (rows: 384, cols: 1536, samples: 10),
+            (rows: 512, cols: 2048, samples: 12),
+            (rows: 640, cols: 1024, samples: 10),
+            (rows: 768, cols: 2560, samples: 12),
+            (rows: 896, cols: 1792, samples: 12),
+            (rows: 1024, cols: 3072, samples: 14),
+            (rows: 1280, cols: 4096, samples: 14),
+            (rows: 1536, cols: 512, samples: 10),
+            (rows: 1792, cols: 1536, samples: 12),
+            (rows: 2048, cols: 4096, samples: 16)
+        ]
+
+        struct PerfResult {
+            let rows: Int
+            let cols: Int
+            let simdgroupAverage: Double
+            let hierarchicalAverage: Double
+            let maxULPDiff: Int
+        }
+
+        var results: [PerfResult] = []
+
+        for (rows, cols, iterations) in cases {
+            print("== GEMV performance case: rows=\(rows) cols=\(cols) ==")
+
+            let warmupRuns = max(2, iterations / 4)
+
+            let (bufferA, bufferB, bufferCTensor, matrixA, vectorB) = try setupMatrixVectorTest(device: context.device, M: rows, K: cols)
+
+            guard let bufferCSimd = context.device.makeBuffer(length: rows * MemoryLayout<Float16>.stride, options: .storageModeShared) else {
+                throw TestError("Could not allocate SIMD GEMV output buffer")
+            }
+            bufferCSimd.contents().initializeMemory(as: UInt8.self, repeating: 0, count: rows * MemoryLayout<Float16>.stride)
+
+            let tensorA = try makeTensor(from: bufferA, rows: rows, columns: cols)
+            let tensorB = try makeTensor(from: bufferB, rows: cols, columns: 1)
+            let tensorC = try makeTensor(from: bufferCTensor, rows: rows, columns: 1)
+
+            let simdgroupEncoder = try SimdMatrixVectorEncoder(
+                device: context.device,
+                library: context.library,
+                compiler: context.compiler,
+                queue: context.commandQueue,
+                tensorA: tensorA,
+                tensorB: tensorB,
+                tensorC: tensorC
+            )
+
+            let hierarchicalEncoder = try SimdHierarchicalMatrixVectorEncoder(
+                device: context.device,
+                library: context.library,
+                compiler: context.compiler,
+                queue: context.commandQueue,
+                bufferA: bufferA,
+                bufferB: bufferB,
+                bufferC: bufferCSimd
+            )
+
+            func measureAverage(label: String, encode: @escaping (MTL4CommandBuffer) throws -> Void) async throws -> Double {
+                var totalMilliseconds: Double = 0
+                for run in 0..<iterations {
+                    guard let commandBuffer = context.device.makeCommandBuffer() else {
+                        throw TestError("Failed to create command buffer for \(label)")
+                    }
+
+                    commandBuffer.beginCommandBuffer(allocator: context.commandAllocator)
+                    let start = ContinuousClock.now
+                    try encode(commandBuffer)
+                    commandBuffer.endCommandBuffer()
+
+                    let commitOptions = MTL4CommitOptions()
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                        commitOptions.addFeedbackHandler { feedback in
+                            if let error = feedback.error {
+                                cont.resume(throwing: TestError("GPU execution failed for \(label): \(error)"))
+                            } else {
+                                cont.resume()
+                            }
+                        }
+                        context.commandQueue.commit([commandBuffer], options: commitOptions)
+                    }
+
+                    let elapsed = start.duration(to: ContinuousClock.now)
+                    let milliseconds = Double(elapsed.components.seconds) * 1_000.0
+                        + Double(elapsed.components.attoseconds) / 1_000_000_000_000_000.0
+                    if run >= warmupRuns {
+                        totalMilliseconds += milliseconds
+                    }
+                }
+
+                let samples = iterations - warmupRuns
+                let average = totalMilliseconds / Double(samples)
+                print("\(label) average over \(samples) runs: \(average) ms")
+                return average
+            }
+
+            let simdgroupAverage = try await measureAverage(label: "Tensor SIMDGROUP GEMV") { commandBuffer in
+                simdgroupEncoder.encode(commandBuffer: commandBuffer, rows: rows)
+            }
+
+            let hierarchicalAverage = try await measureAverage(label: "SIMD Hierarchical GEMV") { commandBuffer in
+                hierarchicalEncoder.encode(commandBuffer: commandBuffer, rows: rows, columns: cols)
+            }
+
+            verifyMatrixVectorResult(bufferC: bufferCTensor, M: rows, K: cols, matrixA: matrixA, vectorB: vectorB, epsilon: 5e-1)
+            verifyMatrixVectorResult(bufferC: bufferCSimd, M: rows, K: cols, matrixA: matrixA, vectorB: vectorB, epsilon: 5e-1)
+
+            let tensorPtr = bufferCTensor.contents().bindMemory(to: Float16.self, capacity: rows)
+            let simdPtr = bufferCSimd.contents().bindMemory(to: Float16.self, capacity: rows)
+            var maxULPDiff = 0
+            for index in 0..<rows {
+                let ulpDiff = abs(Int(tensorPtr[index].bitPattern) - Int(simdPtr[index].bitPattern))
+                if ulpDiff > maxULPDiff {
+                    maxULPDiff = ulpDiff
+                }
+            }
+            print("Max ULP difference between SIMDGROUP and hierarchical GEMV results: \(maxULPDiff)")
+            #expect(maxULPDiff <= 1, "Hierarchical GEMV result deviates from SIMDGROUP result (max ULP diff \(maxULPDiff))")
+
+            results.append(PerfResult(rows: rows, cols: cols, simdgroupAverage: simdgroupAverage, hierarchicalAverage: hierarchicalAverage, maxULPDiff: maxULPDiff))
+        }
+
+        print("== GEMV Performance CSV ==")
+        print("rows,cols,tensorSIMD_ms,hierarchicalSIMD_ms,ulpDiff")
+        for result in results {
+            print("\(result.rows),\(result.cols),\(result.simdgroupAverage),\(result.hierarchicalAverage),\(result.maxULPDiff)")
+        }
+
+        let csvLines = results.map { result in
+            "\(result.rows),\(result.cols),\(result.simdgroupAverage),\(result.hierarchicalAverage),\(result.maxULPDiff)"
+        }
+        let csv = ([ "rows,cols,tensorSIMD_ms,hierarchicalSIMD_ms,ulpDiff" ] + csvLines).joined(separator: "\n") + "\n"
+
+        do {
+            var rootURL = URL(fileURLWithPath: #filePath)
+            while rootURL.lastPathComponent != "MetalTensorOpTests" && rootURL.pathComponents.count > 1 {
+                rootURL.deleteLastPathComponent()
+            }
+            if rootURL.lastPathComponent == "MetalTensorOpTests" {
+                rootURL.deleteLastPathComponent()
+            }
+            let outputDirectory = rootURL.appendingPathComponent("PerfResults", isDirectory: true)
+            try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+            let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let outputURL = outputDirectory.appendingPathComponent("gemv_performance_\(timestamp).csv")
+            try csv.write(to: outputURL, atomically: true, encoding: .utf8)
+            print("Wrote GEMV performance CSV to \(outputURL.path)")
+        } catch {
+            print("Failed to write GEMV performance CSV: \(error)")
+        }
+    }
+
     @Test(.timeLimit(.minutes(1))) func testThreadDynamicMLP() async throws {
         let context = try TestContext()
 

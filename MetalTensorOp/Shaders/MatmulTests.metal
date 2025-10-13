@@ -2,6 +2,7 @@
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal/metal_simdgroup_matrix>
+#include <metal/metal_simdgroup>
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -35,7 +36,7 @@ kernel void simdgroupMatrixVector(
     tensor<device half, dextents<int, 2>> C [[buffer(2)]],
     uint tgy [[threadgroup_position_in_grid]])
 {
-    constexpr auto matmulDescriptor = matmul2d_descriptor(64, 1, dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply);
+    constexpr auto matmulDescriptor = matmul2d_descriptor(64, 1, dynamic_length_v<int>);
     matmul2d<matmulDescriptor, execution_simdgroups<4>> matmulOp;
 
     auto mA = A.slice(0, tgy * 64);
@@ -43,6 +44,89 @@ kernel void simdgroupMatrixVector(
     auto mC = C.slice(0, tgy * 64);
 
     matmulOp.run(mA, mB, mC);
+}
+
+struct GemvConfig {
+    uint rows;
+    uint cols;
+    uint rowsPerSimdgroup;
+    uint simdgroupsPerThreadgroup;
+};
+
+kernel void simdHierarchicalMatrixVector(
+    device const half *A [[buffer(0)]],
+    device const half *B [[buffer(1)]],
+    device half *C [[buffer(2)]],
+    constant GemvConfig &config [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdWidth [[threads_per_simdgroup]],
+    uint simdGroupIndex [[simdgroup_index_in_threadgroup]],
+    uint tgIndex [[threadgroup_position_in_grid]]
+) {
+    constexpr uint VALUES_PER_THREAD = 4;
+    constexpr uint MAX_ROWS_PER_SIMDGROUP = 8;
+    constexpr uint MAX_SIMDGROUPS_PER_THREADGROUP = 8;
+
+    const uint tileWidth = VALUES_PER_THREAD * simdWidth;
+
+    uint rowsPerSimdgroup = max(1u, min(config.rowsPerSimdgroup, MAX_ROWS_PER_SIMDGROUP));
+    uint simdgroupsPerThreadgroup = max(1u, min(config.simdgroupsPerThreadgroup, MAX_SIMDGROUPS_PER_THREADGROUP));
+
+    if (simdGroupIndex >= simdgroupsPerThreadgroup) {
+        return;
+    }
+
+    const uint globalGroup = tgIndex * simdgroupsPerThreadgroup + simdGroupIndex;
+    const uint baseRow = globalGroup * rowsPerSimdgroup;
+
+    const uint totalRows = config.rows;
+    if (baseRow >= totalRows) {
+        return;
+    }
+
+    uint remaining = totalRows - baseRow;
+    uint activeRows = remaining < rowsPerSimdgroup ? remaining : rowsPerSimdgroup;
+
+    float accumulators[MAX_ROWS_PER_SIMDGROUP];
+    const device half *rowPointers[MAX_ROWS_PER_SIMDGROUP];
+    for (uint r = 0; r < activeRows; ++r) {
+        accumulators[r] = 0.0f;
+        rowPointers[r] = A + (baseRow + r) * config.cols;
+    }
+    for (uint r = activeRows; r < MAX_ROWS_PER_SIMDGROUP; ++r) {
+        accumulators[r] = 0.0f;
+        rowPointers[r] = nullptr;
+    }
+
+    for (uint base = 0; base < config.cols; base += tileWidth) {
+        float bVals[VALUES_PER_THREAD];
+        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+            const uint column = base + lane * VALUES_PER_THREAD + i;
+            bVals[i] = (column < config.cols) ? float(B[column]) : 0.0f;
+        }
+
+        for (uint r = 0; r < activeRows; ++r) {
+            const device half *rowPtr = rowPointers[r];
+            float partial = accumulators[r];
+
+            for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+                const uint column = base + lane * VALUES_PER_THREAD + i;
+                if (column < config.cols) {
+                    const float a = float(rowPtr[column]);
+                    partial = fma(a, bVals[i], partial);
+                }
+            }
+
+            accumulators[r] = partial;
+        }
+    }
+
+    for (uint r = 0; r < activeRows; ++r) {
+        const float sum = simd_sum(accumulators[r]);
+        if (lane == 0) {
+            C[baseRow + r] = half(sum);
+        }
+    }
 }
 
 kernel void simdgroupMatrixMatrixMetal3(
